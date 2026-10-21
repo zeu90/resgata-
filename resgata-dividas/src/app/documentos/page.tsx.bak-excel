@@ -1,0 +1,961 @@
+"use client";
+
+import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { getSupabaseBrowserClient } from "@/lib/supabase";
+
+type Wallet = {
+  id: string;
+  name: string;
+  account_type: string;
+  balance: number | string;
+};
+
+type ImportKind = "divida" | "saldo";
+
+const money = (value: number) =>
+  value.toLocaleString("pt-BR", {
+    style: "currency",
+    currency: "BRL",
+  });
+
+function parseAmount(value: string): number {
+  let cleaned = value.replace(/[R$\s]/g, "");
+  if (cleaned.includes(",")) {
+    cleaned = cleaned.replace(/\./g, "").replace(",", ".");
+  }
+  return Number(cleaned);
+}
+
+function findAmount(text: string): string {
+  const matches = [
+    ...text.matchAll(
+      /(?:R\$\s*)?(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2}|\d+\.\d{2})/g,
+    ),
+  ];
+  return matches.at(-1)?.[1]?.replace(/\./g, "").replace(",", ".") ?? "";
+}
+
+function findDate(text: string): string {
+  const match = text.match(/\b(\d{2})[\/.-](\d{2})[\/.-](\d{4})\b/);
+  if (!match) return "";
+  const [, day, month, year] = match;
+  const date = `${year}-${month}-${day}`;
+  const parsed = new Date(`${date}T12:00:00`);
+  return Number.isNaN(parsed.getTime()) ? "" :
+    parsed.toISOString().slice(0, 10);
+}
+
+function parseCSV(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let quoted = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+
+    if (char === '"' && quoted && text[i + 1] === '"') {
+      cell += '"';
+      i++;
+    } else if (char === '"') {
+      quoted = !quoted;
+    } else if ((char === "," || char === ";" || char === "\t") && !quoted) {
+      row.push(cell.trim());
+      cell = "";
+    } else if ((char === "\n" || char === "\r") && !quoted) {
+      if (char === "\r" && text[i + 1] === "\n") i++;
+      row.push(cell.trim());
+      if (row.some(Boolean)) rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += char;
+    }
+  }
+
+  row.push(cell.trim());
+  if (row.some(Boolean)) rows.push(row);
+  return rows;
+}
+
+async function readDocument(file: File): Promise<string> {
+  const name = file.name.toLowerCase();
+
+  if (name.endsWith(".csv")) {
+    return await file.text();
+  }
+
+  if (file.type.startsWith("image/")) {
+    const Tesseract = await import("tesseract.js");
+    const result = await Tesseract.recognize(file, "por+eng");
+    return result.data.text;
+  }
+
+  if (name.endsWith(".pdf") || file.type === "application/pdf") {
+    const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    pdfjs.GlobalWorkerOptions.workerSrc =
+      `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.mjs`;
+
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const pdf = await pdfjs.getDocument({ data: bytes }).promise;
+    const pages: string[] = [];
+
+    for (let i = 1; i <= Math.min(pdf.numPages, 15); i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      pages.push(
+        content.items
+          .map((item) => ("str" in item ? item.str : ""))
+          .join(" "),
+      );
+    }
+
+    const text = pages.join("\n");
+    if (text.trim()) return text;
+
+    throw new Error(
+      "Este PDF não contém texto selecionável. Tire uma captura de tela ou envie uma imagem para usar o OCR.",
+    );
+  }
+
+  throw new Error("Formato não suportado. Envie PDF, JPG, PNG ou CSV.");
+}
+
+
+function buildCsvDebtRows(text: string, userId: string) {
+  const rows = parseCSV(text);
+  if (rows.length < 2) return [];
+
+  const normalize = (value: string) =>
+    value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase().trim();
+
+  const headers = rows[0].map(normalize);
+  // Não aceitar "saldo" ou "total" isoladamente como valor de dívida.
+  // Isso ajuda a evitar importar extratos bancários por engano.
+  const amountIndex = headers.findIndex((h) =>
+    /^(valor da divida|valor devido|valor a pagar|valor em aberto|amount due|debt amount)$/.test(h)
+  );
+  const dateIndex = headers.findIndex((h) =>
+    /vencimento|data de vencimento|due date/.test(h)
+  );
+  const nameIndex = headers.findIndex((h) =>
+    /descricao|nome|historico|description/.test(h)
+  );
+  const creditorIndex = headers.findIndex((h) =>
+    /credor|empresa|instituicao|fornecedor|creditor/.test(h)
+  );
+
+  if (amountIndex < 0) return [];
+
+  const result: {
+    user_id: string;
+    name: string;
+    creditor: string;
+    amount: number;
+    due_date: string | null;
+    category: string;
+    priority: string;
+    status: string;
+  }[] = [];
+
+  const seen = new Set<string>();
+
+  for (const row of rows.slice(1)) {
+    const rawAmount = row[amountIndex] ?? "";
+    const amount = parseAmount(rawAmount);
+    if (!rawAmount.trim() || !Number.isFinite(amount) || amount <= 0) continue;
+
+    const name = (nameIndex >= 0 ? row[nameIndex] : "").trim()
+      || "Dívida importada";
+    const creditor = (creditorIndex >= 0 ? row[creditorIndex] : "").trim()
+      || "Não identificado";
+
+    const rawDate = dateIndex >= 0 ? (row[dateIndex] ?? "").trim() : "";
+    let dueDate: string | null = null;
+    if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+      dueDate = rawDate;
+    } else if (rawDate) {
+      dueDate = findDate(rawDate) || null;
+    }
+
+    const key = [
+      normalize(name), normalize(creditor), amount.toFixed(2), dueDate ?? ""
+    ].join("|");
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    result.push({
+      user_id: userId,
+      name,
+      creditor,
+      amount,
+      due_date: dueDate,
+      category: "outra",
+      priority: "normal",
+      status: "pendente",
+    });
+  }
+
+  return result;
+}
+
+export default function DocumentosPage() {
+  const router = useRouter();
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const [userId, setUserId] = useState("");
+  const [wallets, setWallets] = useState<Wallet[]>([]);
+  const [kind, setKind] = useState<ImportKind>("divida");
+  const [walletId, setWalletId] = useState("");
+  const [fileName, setFileName] = useState("");
+  const [selectedFileUrl, setSelectedFileUrl] = useState("");
+  const [selectedFileType, setSelectedFileType] = useState("");
+  const [extractedText, setExtractedText] = useState("");
+  const [name, setName] = useState("");
+  const [creditor, setCreditor] = useState("");
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [csvRows, setCsvRows] = useState<string[][]>([]);
+  const [reviewReady, setReviewReady] = useState(false);
+
+  useEffect(() => {
+    if (!selectedFileUrl) return;
+    return () => URL.revokeObjectURL(selectedFileUrl);
+  }, [selectedFileUrl]);
+
+  useEffect(() => {
+    let active = true;
+
+    async function load() {
+      const supabase = getSupabaseBrowserClient();
+      const { data, error: authError } = await supabase.auth.getUser();
+
+      if (!active) return;
+      if (authError || !data.user) {
+        router.replace("/login");
+        return;
+      }
+
+      setUserId(data.user.id);
+
+      const { data: accounts, error: accountError } = await supabase
+        .from("wallet_accounts")
+        .select("id,name,account_type,balance")
+        .eq("user_id", data.user.id)
+        .order("created_at", { ascending: true });
+
+      if (!active) return;
+
+      if (accountError) {
+        setError("Não foi possível carregar suas contas financeiras.");
+        return;
+      }
+
+      setWallets((accounts ?? []) as Wallet[]);
+      if (accounts?.length) setWalletId(accounts[0].id);
+    }
+
+    void load();
+    return () => {
+      active = false;
+    };
+  }, [router]);
+
+  async function handleFile(file?: File) {
+    if (!file) return;
+
+    setLoading(true);
+    setError("");
+    setMessage("");
+    setFileName(file.name);
+   setSelectedFileUrl(URL.createObjectURL(file));
+   setSelectedFileType(
+     file.type ||
+       (file.name.toLowerCase().endsWith(".pdf")
+         ? "application/pdf"
+         : file.name.toLowerCase().endsWith(".csv")
+           ? "text/csv"
+           : ""),
+   );
+    setExtractedText("");
+    setCsvRows([]);
+    setReviewReady(false);
+
+    try {
+      const text = await readDocument(file);
+      setExtractedText(text);
+
+      if (file.name.toLowerCase().endsWith(".csv")) {
+        const rows = parseCSV(text);
+        setCsvRows(rows);
+
+        if (rows.length > 1) {
+          setMessage(
+            `CSV lido: ${rows.length - 1} linhas de dados. Confira a tabela antes de importar.`,
+          );
+
+          const headers = rows[0].map((h) => h.toLowerCase());
+          const amountIndex = headers.findIndex((h) =>
+            /valor|saldo|amount|total/.test(h),
+          );
+          const dateIndex = headers.findIndex((h) =>
+            /data|vencimento|date/.test(h),
+          );
+          const descriptionIndex = headers.findIndex((h) =>
+            /descri|nome|credor|hist.rico|description/.test(h),
+          );
+
+          const first = rows[1];
+          if (amountIndex >= 0 && first[amountIndex]) {
+            setAmount(String(parseAmount(first[amountIndex])));
+          }
+          if (dateIndex >= 0 && first[dateIndex]) {
+            setDate(findDate(first[dateIndex]) || first[dateIndex]);
+          }
+          if (descriptionIndex >= 0 && first[descriptionIndex]) {
+            setName(first[descriptionIndex]);
+            setCreditor(first[descriptionIndex]);
+          }
+        } else {
+          setError("O CSV não contém linhas de dados suficientes.");
+        }
+      } else {
+        setAmount(findAmount(text));
+        setDate(findDate(text));
+
+        const lines = text
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean);
+
+        const candidate = lines.find(
+          (line) =>
+            line.length >= 3 &&
+            !/R\$|saldo|vencimento|vencida|pagamento|extrato/i.test(line),
+        );
+
+        if (candidate) {
+          setName(candidate.slice(0, 100));
+          setCreditor(candidate.slice(0, 100));
+        }
+
+        setMessage(
+          "Leitura concluída. Confira e corrija os campos antes de salvar.",
+        );
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Não foi possível ler o documento.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function saveRecord(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+
+    if (!userId) {
+      setError("Sua sessão expirou. Entre novamente.");
+      router.replace("/login");
+      return;
+    }
+
+    const numericAmount = parseAmount(amount);
+    const isCsvDebtBatch =
+      kind === "divida" &&
+      fileName.toLowerCase().endsWith(".csv") &&
+      csvRows.length > 1;
+
+    if (!isCsvDebtBatch && (
+        !Number.isFinite(numericAmount) ||
+        numericAmount < 0 ||
+        (kind === "divida" && numericAmount <= 0)
+    )) {
+      setError("Confira o valor informado.");
+      return;
+    }
+
+
+    if (kind === "saldo" && !walletId) {
+      setError("Cadastre ou selecione uma conta em Finanças primeiro.");
+      return;
+    }
+
+    if (!reviewReady) {
+      setReviewReady(true);
+      setMessage("Planilha preparada. Confira os dados abaixo e clique novamente para confirmar e salvar.");
+      return;
+    }
+
+    setSaving(true);
+
+    try {
+      const supabase = getSupabaseBrowserClient();
+
+      if (kind === "divida") {
+        if (fileName.toLowerCase().endsWith(".csv") && csvRows.length > 1) {
+          const batch = buildCsvDebtRows(extractedText, userId);
+          if (!batch.length) {
+            throw new Error(
+              "Não encontrei valores positivos numa coluna reconhecida. Confira se o CSV possui uma coluna chamada Valor ou Amount."
+            );
+          }
+
+          const { error: batchError } = await supabase.from("debts").insert(batch);
+          if (batchError) throw batchError;
+
+          setMessage(`${batch.length} dívida(s) importada(s). Confira na página Dívidas.`);
+          setAmount("");
+          setName("");
+          setCreditor("");
+          setDate("");
+          setExtractedText("");
+          setCsvRows([]);
+          setFileName("");
+          if (inputRef.current) inputRef.current.value = "";
+          return;
+        }
+
+        const { error: insertError } = await supabase.from("debts").insert({
+          user_id: userId,
+          name: name.trim() || "Dívida importada",
+          creditor: creditor.trim() || "Não identificado",
+          amount: numericAmount,
+          due_date: date || null,
+          category: "outra",
+          priority: "normal",
+          status: "pendente",
+        });
+
+        if (insertError) throw insertError;
+        setMessage("Dívida cadastrada. Confira na página Dívidas.");
+      } else {
+        const { error: updateError } = await supabase
+          .from("wallet_accounts")
+          .update({
+            balance: numericAmount,
+            updated_at: new Date().toISOString(),
+          })
+          .eq("id", walletId)
+          .eq("user_id", userId);
+
+        if (updateError) throw updateError;
+        setMessage("Saldo atualizado. Confira na página Finanças.");
+      }
+
+      setAmount("");
+      setName("");
+      setCreditor("");
+      setDate("");
+      setExtractedText("");
+      setCsvRows([]);
+      setFileName("");
+      if (inputRef.current) inputRef.current.value = "";
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Não foi possível salvar os dados.",
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <main style={{
+      minHeight: "100vh",
+      background: "radial-gradient(ellipse at 8% 5%, rgba(59,130,246,.20), transparent 34%), radial-gradient(ellipse at 92% 12%, rgba(20,184,166,.20), transparent 32%), radial-gradient(ellipse at 70% 90%, rgba(139,92,246,.12), transparent 36%), linear-gradient(135deg, #edf4ff 0%, #eefaf8 48%, #f4f1ff 100%)",
+      color: "#172033",
+      padding: "32px 16px 56px",
+    }}>
+      <div style={{ maxWidth: 1180, margin: "0 auto" }}>
+        <header style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 16,
+          marginBottom: 30,
+          paddingBottom: 22,
+          borderBottom: "1px solid rgba(148,163,184,.35)",
+        }}>
+          <div>
+            <Link href="/dashboard" style={{
+              color: "#087e8b",
+              textDecoration: "none",
+              fontWeight: 800,
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "9px 14px",
+              borderRadius: 999,
+              background: "rgba(255,255,255,.82)",
+              border: "1px solid rgba(8,126,139,.18)",
+            }}>
+              ← Voltar ao painel
+            </Link>
+            <h1 style={{ margin: "14px 0 8px", fontSize: "clamp(30px, 4vw, 40px)", fontWeight: 850, letterSpacing: "-1.4px", color: "#172033", lineHeight: 1.12 }}>
+              Documentos
+            </h1>
+            <p style={{ margin: 0, color: "#64748b", lineHeight: 1.6 }}>
+              Extraia valores e datas sem arquivar os documentos originais.
+            </p>
+          </div>
+          <nav style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+            <Link href="/dividas" style={{
+              textDecoration: "none",
+              color: "#334155",
+              fontWeight: 750,
+              padding: "11px 16px",
+              borderRadius: 12,
+              background: "rgba(255,255,255,.88)",
+              border: "1px solid #dbe5ef",
+              boxShadow: "0 4px 12px rgba(15,23,42,.04)",
+            }}>Dívidas</Link>
+            <Link href="/financeiro" style={{
+              textDecoration: "none",
+              color: "#fff",
+              fontWeight: 750,
+              padding: "11px 16px",
+              borderRadius: 12,
+              background: "linear-gradient(135deg, #0f766e, #0e7490)",
+              boxShadow: "0 6px 16px rgba(15,118,110,.20)",
+            }}>Finanças</Link>
+          </nav>
+        </header>
+
+        <section style={{
+          background: "rgba(255,255,255,.96)",
+          border: "1px solid rgba(255,255,255,.95)",
+          borderRadius: 24,
+          padding: "clamp(20px, 4vw, 34px)",
+          boxShadow: "0 22px 60px rgba(30,64,110,.12), 0 3px 10px rgba(15,23,42,.04)",
+        }}>
+          <h2 style={{ marginTop: 0, marginBottom: 10, fontSize: 22, fontWeight: 800, letterSpacing: "-.5px", color: "#172033" }}>1. Envie um documento</h2>
+          <p style={{ color: "#64748b", lineHeight: 1.6 }}>
+            Formatos aceitos: PDF, JPG, PNG e CSV. A leitura pode exigir
+            conexão com a internet para carregar os recursos de OCR.
+          </p>
+
+          <input
+            ref={inputRef}
+            type="file"
+            accept=".pdf,.csv,.jpg,.jpeg,.png,.webp,application/pdf,text/csv,image/*"
+            onChange={(event) => void handleFile(event.target.files?.[0])}
+            style={{
+              display: "block",
+              width: "100%",
+              boxSizing: "border-box",
+              padding: 16,
+              border: "1px dashed #94a3b8",
+              borderRadius: 16,
+              background: "linear-gradient(135deg, #f0f7ff, #effcf9)",
+              minHeight: 62,
+              cursor: "pointer",
+            }}
+          />
+
+          {selectedFileUrl && (
+           <section
+             aria-label="Visualização do arquivo enviado"
+             style={{
+               marginTop: 24,
+               padding: "clamp(16px, 3vw, 24px)",
+               borderRadius: 20,
+               border: "1px solid #cbdcf0",
+               background: "linear-gradient(135deg, #eff6ff, #f0fdfa)",
+               boxShadow: "0 10px 28px rgba(30,64,110,.08)",
+             }}
+           >
+             <div style={{
+               display: "flex",
+               flexWrap: "wrap",
+               alignItems: "center",
+               justifyContent: "space-between",
+               gap: 12,
+               marginBottom: 16,
+             }}>
+               <div>
+                 <h2 style={{ margin: 0, color: "#172033", fontSize: 21 }}>
+                   Visualizar arquivo
+                 </h2>
+                 <p style={{ margin: "6px 0 0", color: "#64748b", fontSize: 14 }}>
+                   Confira o documento original antes de importar os dados.
+                 </p>
+               </div>
+               <span style={{
+                 padding: "7px 11px",
+                 borderRadius: 999,
+                 background: "#dbeafe",
+                 color: "#1d4ed8",
+                 fontSize: 12,
+                 fontWeight: 800,
+               }}>
+                 {selectedFileType === "application/pdf" ||
+                 fileName.toLowerCase().endsWith(".pdf")
+                   ? "PDF"
+                   : selectedFileType.startsWith("image/") ||
+                       /\.(jpg|jpeg|png|webp|gif)$/i.test(fileName)
+                     ? "IMAGEM"
+                     : "CSV"}
+               </span>
+             </div>
+
+             {(selectedFileType.startsWith("image/") ||
+               /\.(jpg|jpeg|png|webp|gif)$/i.test(fileName)) ? (
+               <div style={{
+                 display: "flex",
+                 justifyContent: "center",
+                 padding: 12,
+                 background: "#fff",
+                 border: "1px solid #dbe5ef",
+                 borderRadius: 14,
+                 overflow: "auto",
+               }}>
+                 <img
+                   src={selectedFileUrl}
+                   alt={`Pré-visualização de ${fileName}`}
+                   style={{
+                     display: "block",
+                     maxWidth: "100%",
+                     maxHeight: 650,
+                     objectFit: "contain",
+                     borderRadius: 8,
+                   }}
+                 />
+               </div>
+             ) : selectedFileType === "application/pdf" ||
+                 fileName.toLowerCase().endsWith(".pdf") ? (
+               <iframe
+                 title={`Pré-visualização de ${fileName}`}
+                 src={selectedFileUrl}
+                 style={{
+                   display: "block",
+                   width: "100%",
+                   height: 600,
+                   border: "1px solid #dbe5ef",
+                   borderRadius: 14,
+                   background: "#fff",
+                 }}
+               />
+             ) : (
+               <div style={{
+                 padding: 18,
+                 background: "#fff",
+                 border: "1px solid #dbe5ef",
+                 borderRadius: 14,
+                 color: "#334155",
+               }}>
+                 <p style={{ margin: "0 0 8px", fontWeight: 750 }}>
+                   <span aria-hidden="true">▦ </span>
+                   Tabela do CSV
+                 </p>
+                 <p style={{ margin: 0, color: "#64748b", lineHeight: 1.6 }}>
+                   Os dados aparecem na tabela abaixo, com cabeçalhos e linhas
+                   para você conferir antes de importar.
+                 </p>
+               </div>
+             )}
+           </section>
+         )}
+
+         {fileName && (
+            <p style={{ color: "#64748b", overflowWrap: "anywhere" }}>
+              Arquivo em processamento: <strong>{fileName}</strong>
+            </p>
+          )}
+          {loading && <p role="status">Lendo documento. Aguarde...</p>}
+          {error && (
+            <p role="alert" style={{
+              padding: "14px 16px",
+              borderRadius: 12,
+              border: "1px solid #f3caca",
+              background: "#fff5f5",
+              color: "#a52323",
+            }}>
+              {error}
+            </p>
+          )}
+          {message && (
+            <p role="status" style={{
+              padding: "14px 16px",
+              borderRadius: 12,
+              border: "1px solid #bfe8d7",
+              background: "#effaf5",
+              color: "#12634b",
+            }}>
+              {message}
+            </p>
+          )}
+
+          <form onSubmit={saveRecord} style={{ marginTop: 28, paddingTop: 24, borderTop: "1px solid #e2ebef" }}>
+            <h2 style={{ marginTop: 0, marginBottom: 8, fontSize: 23, fontWeight: 850, color: "#172033" }}>
+              2. Conferir e importar
+            </h2>
+            <p style={{ color: "#64748b", lineHeight: 1.6, marginTop: 0 }}>
+              Prepare a planilha, confira os dados extraídos e só então confirme a gravação.
+            </p>
+
+            <label htmlFor="document-kind" style={labelStyle}>
+              Destino dos dados
+            </label>
+            <select
+              id="document-kind"
+              value={kind}
+              onChange={(event) => {
+                setKind(event.target.value as ImportKind);
+                setReviewReady(false);
+                setMessage("");
+              }}
+              style={inputStyle}
+            >
+              <option value="divida">Dívidas — importar cobranças pendentes</option>
+              <option value="saldo">Finanças — atualizar saldo de uma conta</option>
+            </select>
+
+            {kind === "saldo" && (
+              <>
+                <label htmlFor="document-wallet" style={labelStyle}>
+                  Conta financeira
+                </label>
+                <select
+                  id="document-wallet"
+                  value={walletId}
+                  onChange={(event) => setWalletId(event.target.value)}
+                  style={inputStyle}
+                  required
+                >
+                  <option value="">Selecione uma conta</option>
+                  {wallets.map((wallet) => (
+                    <option key={wallet.id} value={wallet.id}>
+                      {wallet.name} — saldo atual: {money(Number(wallet.balance))}
+                    </option>
+                  ))}
+                </select>
+                <p style={{ color: "#64748b", fontSize: 13, lineHeight: 1.5 }}>
+                  O saldo confirmado substituirá o saldo atual; ele não será somado.
+                </p>
+              </>
+            )}
+
+            <button
+              type="submit"
+              disabled={saving || loading}
+              style={{
+                width: "100%",
+                marginTop: 18,
+                padding: "15px 18px",
+                border: 0,
+                borderRadius: 14,
+                background: saving || loading
+                  ? "#91aeb4"
+                  : reviewReady
+                    ? "linear-gradient(135deg, #15803d, #0f766e)"
+                    : "linear-gradient(135deg, #087e8b, #075985)",
+                color: "#fff",
+                fontSize: 16,
+                fontWeight: 800,
+                boxShadow: "0 8px 18px rgba(8,126,139,.18)",
+                cursor: saving || loading ? "wait" : "pointer",
+              }}
+            >
+              {saving
+                ? "Salvando..."
+                : reviewReady
+                  ? "✓ Confirmar e salvar dados"
+                  : "Preparar planilha para conferência"}
+            </button>
+
+            {reviewReady && (
+              <section
+                aria-label="Planilha de conferência dos dados extraídos"
+                style={{
+                  marginTop: 22,
+                  padding: 18,
+                  borderRadius: 18,
+                  border: "1px solid #bfdbfe",
+                  background: "linear-gradient(135deg, #eff6ff, #f0fdfa)",
+                  boxShadow: "0 8px 24px rgba(30,64,110,.07)",
+                }}
+              >
+                <div style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 10,
+                  marginBottom: 14,
+                }}>
+                  <div>
+                    <h3 style={{ margin: 0, fontSize: 19, color: "#172033" }}>
+                      Planilha de conferência
+                    </h3>
+                    <p style={{ margin: "5px 0 0", color: "#64748b", fontSize: 13 }}>
+                      Confira os valores antes de gravar no sistema.
+                    </p>
+                  </div>
+                  <span style={{
+                    padding: "6px 10px",
+                    borderRadius: 999,
+                    background: "#dbeafe",
+                    color: "#1d4ed8",
+                    fontWeight: 800,
+                    fontSize: 12,
+                  }}>
+                    {kind === "divida" ? "DÍVIDAS" : "SALDO FINANCEIRO"}
+                  </span>
+                </div>
+
+                <div style={{ overflowX: "auto", borderRadius: 12, background: "#fff" }}>
+                  <table style={{
+                    width: "100%",
+                    borderCollapse: "collapse",
+                    minWidth: 600,
+                    fontSize: 13,
+                  }}>
+                    <thead>
+                      <tr style={{ background: "#e0f2fe", color: "#164e63" }}>
+                        {(kind === "saldo"
+                          ? ["Conta", "Saldo extraído", "Arquivo"]
+                          : csvRows.length > 1
+                            ? csvRows[0]
+                            : ["Descrição", "Credor", "Vencimento", "Valor (R$)"]
+                        ).map((heading, index) => (
+                          <th key={index} style={{
+                            padding: "12px 14px",
+                            borderBottom: "1px solid #cbd5e1",
+                            textAlign: "left",
+                            whiteSpace: "nowrap",
+                          }}>
+                            {heading || `Coluna ${index + 1}`}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {kind === "saldo" ? (
+                        <tr>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0" }}>
+                            {wallets.find((wallet) => wallet.id === walletId)?.name || "Conta não selecionada"}
+                          </td>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0", fontWeight: 800, color: "#0f766e" }}>
+                            {money(parseAmount(amount))}
+                          </td>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0", overflowWrap: "anywhere" }}>
+                            {fileName || "—"}
+                          </td>
+                        </tr>
+                      ) : csvRows.length > 1 ? (
+                        csvRows.slice(1, 101).map((row, rowIndex) => (
+                          <tr key={rowIndex} style={{ background: rowIndex % 2 ? "#f8fafc" : "#fff" }}>
+                            {csvRows[0].map((_, columnIndex) => (
+                              <td key={columnIndex} style={{
+                                padding: "11px 14px",
+                                borderBottom: "1px solid #e2e8f0",
+                                whiteSpace: "nowrap",
+                              }}>
+                                {row[columnIndex] || "—"}
+                              </td>
+                            ))}
+                          </tr>
+                        ))
+                      ) : (
+                        <tr>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0" }}>
+                            {name.trim() || "Dívida importada"}
+                          </td>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0" }}>
+                            {creditor.trim() || "Não identificado"}
+                          </td>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0" }}>
+                            {date || "Data não identificada"}
+                          </td>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0", fontWeight: 800, color: "#b45309" }}>
+                            {money(parseAmount(amount))}
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                <p style={{ margin: "12px 0 0", color: "#475569", fontSize: 13, lineHeight: 1.6 }}>
+                  {kind === "divida" && csvRows.length > 1
+                    ? `Prévia de até 100 linhas. A importação considera as linhas válidas reconhecidas como dívidas.`
+                    : "Esta é a prévia dos dados extraídos. Confira o valor e o destino antes de salvar."}
+                </p>
+              </section>
+            )}
+          </form>
+
+          {extractedText && (
+            <details style={{ marginTop: 24 }}>
+              <summary style={{ cursor: "pointer", fontWeight: 700 }}>
+                Conferir texto extraído
+              </summary>
+              <pre style={{
+                whiteSpace: "pre-wrap",
+                overflowWrap: "anywhere",
+                maxHeight: 300,
+                overflow: "auto",
+                padding: 14,
+                background: "#f4f8fa",
+                borderRadius: 10,
+                fontSize: 12,
+              }}>
+                {extractedText.slice(0, 20000)}
+              </pre>
+            </details>
+          )}
+        </section>
+
+        <p style={{
+          color: "#64748b",
+          fontSize: 13,
+          lineHeight: 1.7,
+          marginTop: 18,
+        }}>
+          Privacidade: esta página não envia os arquivos para o armazenamento
+          do Supabase. O processamento ocorre temporariamente no navegador.
+          Os valores só são gravados depois da confirmação. Confira sempre
+          os dados extraídos antes de salvar.
+        </p>
+      </div>
+    </main>
+  );
+}
+
+const labelStyle: React.CSSProperties = {
+  display: "block",
+  marginTop: 18,
+  marginBottom: 7,
+  fontWeight: 700,
+  fontSize: 14,
+};
+
+const inputStyle: React.CSSProperties = {
+  display: "block",
+  width: "100%",
+  boxSizing: "border-box",
+  minHeight: 48,
+  padding: "12px 14px",
+  border: "1px solid #cbd5e1",
+  borderRadius: 12,
+  background: "#fff",
+  color: "#172033",
+  fontSize: 15,
+  outlineColor: "#087e8b",
+};

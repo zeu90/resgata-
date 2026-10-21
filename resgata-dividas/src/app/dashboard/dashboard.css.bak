@@ -1,0 +1,691 @@
+/* =========================================
+   RESGATA DÍVIDAS — PAINEL FINANCEIRO
+   Folha exclusiva do dashboard
+========================================= */
+
+.dashboard-page {
+  --dash-bg: #f3f7f8;
+  --dash-card: #ffffff;
+  --dash-ink: #142e3a;
+  --dash-muted: #70838d;
+  --dash-primary: #087f8c;
+  --dash-primary-dark: #075b68;
+  --dash-border: #e1eaed;
+  --dash-green: #16845b;
+  --dash-red: #c84b52;
+
+  min-height: 100vh;
+  padding: 0 0 36px;
+  color: var(--dash-ink);
+  background: var(--dash-bg);
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, sans-serif;
+}
+
+.dashboard-page *,
+.dashboard-page *::before,
+.dashboard-page *::after {
+  box-sizing: border-box;
+}
+
+.dashboard-page a {
+  color: inherit;
+  text-decoration: none;
+}
+
+.dashboard-page button {
+  font: inherit;
+}
+
+/* Cabeçalho */
+
+.dashboard-page .dash-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  width: 100%;
+  padding: 18px clamp(18px, 5vw, 72px);
+  background: #fff;
+  border-bottom: 1px solid var(--dash-border);
+  box-shadow: 0 3px 18px rgb(20 46 58 / 4%);
+}
+
+.dashboard-page .dash-brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+  font-size: 19px;
+  font-weight: 800;
+  letter-spacing: -0.6px;
+}
+
+.dashboard-page .dash-brand-mark {
+  display: grid;
+  width: 44px;
+  height: 44px;
+  flex-shrink: 0;
+  place-items: center;
+  color: white;
+  background: linear-gradient(145deg, #10a6a1, #087080);
+  border-radius: 14px;
+  box-shadow: 0 7px 15px rgb(8 127 140 / 20%);
+}
+
+.dashboard-page .dash-brand-light {
+  color: var(--dash-primary);
+}
+
+.dashboard-page .dash-nav {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.dashboard-page .dash-nav-link,
+.dashboard-page .dash-logout {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 40px;
+  padding: 9px 14px;
+  color: #536a75;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 10px;
+  font-size: 13px;
+  font-weight: 650;
+  transition: background .2s, color .2s, border-color .2s;
+  cursor: pointer;
+}
+
+.dashboard-page .dash-nav-link:hover,
+.dashboard-page .dash-nav-link:focus-visible {
+  color: var(--dash-primary-dark);
+  background: #eaf7f7;
+  border-color: #d3eeee;
+}
+
+.dashboard-page .dash-logout {
+  color: #a63e47;
+  border-color: #f0dfe1;
+}
+
+.dashboard-page .dash-logout:hover {
+  background: #fff0f1;
+}
+
+/* Área principal */
+
+.dashboard-page .dash-welcome,
+.dashboard-page .dash-section,
+.dashboard-page .dash-savings-section,
+.dashboard-page .dash-error,
+.dashboard-page .dash-footer {
+  width: min(1180px, calc(100% - 48px));
+  margin-right: auto;
+  margin-left: auto;
+}
+
+.dashboard-page .dash-welcome {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 28px;
+  overflow: hidden;
+  margin-top: 32px;
+  padding: clamp(26px, 4vw, 46px);
+  color: #fff;
+  background: linear-gradient(115deg, #073b4a 0%, #087f8c 65%, #12a69c 100%);
+  border-radius: 24px;
+  box-shadow: 0 15px 36px rgb(7 91 104 / 17%);
+}
+
+.dashboard-page .dash-welcome::after {
+  position: absolute;
+  top: -100px;
+  right: -55px;
+  width: 280px;
+  height: 280px;
+  content: "";
+  border: 1px solid rgb(255 255 255 / 13%);
+  border-radius: 50%;
+  box-shadow: 0 0 0 35px rgb(255 255 255 / 5%),
+              0 0 0 70px rgb(255 255 255 / 4%);
+  pointer-events: none;
+}
+
+.dashboard-page .dash-welcome-copy {
+  position: relative;
+  z-index: 1;
+  max-width: 680px;
+}
+
+.dashboard-page .dash-eyebrow,
+.dashboard-page .dash-section-kicker {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 1.6px;
+  text-transform: uppercase;
+}
+
+.dashboard-page .dash-eyebrow {
+  color: #b8f2e9;
+}
+
+.dashboard-page .dash-welcome h1 {
+  margin: 0 0 12px;
+  color: #fff;
+  font-size: clamp(27px, 4vw, 40px);
+  font-weight: 800;
+  line-height: 1.15;
+  letter-spacing: -1.2px;
+}
+
+.dashboard-page .dash-welcome p {
+  max-width: 590px;
+  margin: 0;
+  color: #e0f2f4;
+  font-size: 15px;
+  line-height: 1.75;
+}
+
+.dashboard-page .dash-status-dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 7px;
+  background: #8af0c2;
+  border-radius: 50%;
+}
+
+.dashboard-page .dash-primary-button,
+.dashboard-page .dash-savings-button {
+  position: relative;
+  z-index: 1;
+  display: inline-flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 46px;
+  padding: 12px 19px;
+  color: #07515c;
+  background: #fff;
+  border: 0;
+  border-radius: 12px;
+  font-size: 13px;
+  font-weight: 800;
+  box-shadow: 0 5px 14px rgb(0 0 0 / 8%);
+  transition: transform .2s, box-shadow .2s;
+  cursor: pointer;
+}
+
+.dashboard-page .dash-primary-button:hover,
+.dashboard-page .dash-savings-button:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 9px 22px rgb(0 0 0 / 13%);
+}
+
+/* Avisos */
+
+.dashboard-page .dash-error {
+  margin-top: 20px;
+  padding: 15px 18px;
+  color: #a62e3b;
+  background: #fff0f1;
+  border: 1px solid #f4cdd1;
+  border-radius: 12px;
+  font-size: 14px;
+  line-height: 1.6;
+}
+
+/* Seções e títulos */
+
+.dashboard-page .dash-section {
+  margin-top: 34px;
+}
+
+.dashboard-page .dash-section-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 18px;
+}
+
+.dashboard-page .dash-section-kicker {
+  margin-bottom: 6px;
+  color: var(--dash-primary);
+  font-size: 10px;
+}
+
+.dashboard-page .dash-section-heading h2,
+.dashboard-page .dash-savings-copy h2 {
+  margin: 0;
+  color: var(--dash-ink);
+  font-size: clamp(20px, 2.5vw, 25px);
+  font-weight: 800;
+  letter-spacing: -.6px;
+}
+
+.dashboard-page .dash-section-heading p {
+  margin: 7px 0 0;
+  color: var(--dash-muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.dashboard-page .dash-text-link {
+  flex-shrink: 0;
+  color: var(--dash-primary);
+  font-size: 13px;
+  font-weight: 750;
+}
+
+.dashboard-page .dash-text-link:hover {
+  color: var(--dash-primary-dark);
+  text-decoration: underline;
+}
+
+/* Indicadores financeiros */
+
+.dashboard-page .dash-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 18px;
+}
+
+.dashboard-page .dash-stat-card {
+  position: relative;
+  min-width: 0;
+  padding: 23px;
+  overflow: hidden;
+  background: var(--dash-card);
+  border: 1px solid var(--dash-border);
+  border-radius: 18px;
+  box-shadow: 0 5px 18px rgb(24 58 70 / 3%);
+  transition: transform .2s, box-shadow .2s, border-color .2s;
+}
+
+.dashboard-page .dash-stat-card:hover {
+  transform: translateY(-3px);
+  border-color: #c9e3e6;
+  box-shadow: 0 12px 25px rgb(24 58 70 / 8%);
+}
+
+.dashboard-page .dash-stat-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 23px;
+}
+
+.dashboard-page .dash-stat-icon {
+  display: grid;
+  width: 45px;
+  height: 45px;
+  place-items: center;
+  color: #087f8c;
+  background: #e7f7f6;
+  border-radius: 14px;
+  font-size: 21px;
+}
+
+.dashboard-page .dash-stat-label {
+  display: block;
+  margin-bottom: 9px;
+  color: var(--dash-muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.dashboard-page .dash-stat-value {
+  display: block;
+  overflow-wrap: anywhere;
+  color: var(--dash-ink);
+  font-size: clamp(21px, 2.3vw, 30px);
+  font-weight: 850;
+  line-height: 1.2;
+  letter-spacing: -1px;
+  font-variant-numeric: tabular-nums;
+}
+
+.dashboard-page .dash-stat-description {
+  display: block;
+  margin-top: 10px;
+  color: var(--dash-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.dashboard-page .dash-stat-overdue .dash-stat-icon {
+  color: #bd3d49;
+  background: #fff0f0;
+}
+
+.dashboard-page .dash-stat-overdue .dash-stat-value {
+  color: var(--dash-red);
+}
+
+.dashboard-page .dash-stat-upcoming .dash-stat-icon {
+  color: #a56b13;
+  background: #fff5df;
+}
+
+.dashboard-page .dash-stat-paid .dash-stat-icon {
+  color: var(--dash-green);
+  background: #e9f8f0;
+}
+
+.dashboard-page .dash-stat-paid .dash-stat-value {
+  color: var(--dash-green);
+}
+
+/* Estados vazios */
+
+.dashboard-page .dash-empty {
+  padding: 28px 20px;
+  color: var(--dash-muted);
+  background: #fff;
+  border: 1px dashed #cadce1;
+  border-radius: 16px;
+  text-align: center;
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.dashboard-page .dash-empty-icon {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  margin: 0 auto 12px;
+  place-items: center;
+  color: var(--dash-primary);
+  background: #eaf7f7;
+  border-radius: 15px;
+  font-size: 22px;
+}
+
+/* Economia sem apostas */
+
+.dashboard-page .dash-savings-section {
+  display: grid;
+  grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr);
+  gap: 30px;
+  margin-top: 30px;
+  padding: clamp(24px, 4vw, 36px);
+  background: linear-gradient(135deg, #fff 0%, #f0fbf7 100%);
+  border: 1px solid #d9eee5;
+  border-radius: 22px;
+  box-shadow: 0 6px 22px rgb(24 58 70 / 3%);
+}
+
+.dashboard-page .dash-savings-copy h2 {
+  margin-bottom: 10px;
+}
+
+.dashboard-page .dash-savings-copy p {
+  margin: 0;
+  color: var(--dash-muted);
+  font-size: 14px;
+  line-height: 1.8;
+}
+
+.dashboard-page .dash-savings-icon {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  margin-bottom: 16px;
+  place-items: center;
+  color: #13794f;
+  background: #dff6e9;
+  border-radius: 15px;
+  font-size: 23px;
+}
+
+.dashboard-page .dash-savings-stats {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-content: center;
+  gap: 12px;
+}
+
+.dashboard-page .dash-savings-stat {
+  padding: 18px;
+  background: #fff;
+  border: 1px solid #e0eee7;
+  border-radius: 14px;
+}
+
+.dashboard-page .dash-savings-stat strong {
+  display: block;
+  margin-bottom: 7px;
+  color: #13794f;
+  font-size: clamp(19px, 2vw, 26px);
+  font-weight: 850;
+  overflow-wrap: anywhere;
+}
+
+.dashboard-page .dash-savings-stat span {
+  color: var(--dash-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.dashboard-page .dash-savings-empty {
+  padding: 15px;
+  color: #527566;
+  background: #fff;
+  border-radius: 12px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+
+.dashboard-page .dash-savings-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 15px;
+  grid-column: 1 / -1;
+  padding-top: 20px;
+  border-top: 1px solid #dcece4;
+}
+
+.dashboard-page .dash-savings-button {
+  color: #fff;
+  background: #117b59;
+  box-shadow: none;
+}
+
+.dashboard-page .dash-savings-button:hover {
+  background: #0b6247;
+}
+
+/* Carregamento */
+
+.dashboard-page .dash-loading {
+  display: flex;
+  min-height: 55vh;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  color: var(--dash-muted);
+  font-size: 14px;
+}
+
+.dashboard-page .dash-spinner {
+  width: 38px;
+  height: 38px;
+  border: 3px solid #d8e9ec;
+  border-top-color: var(--dash-primary);
+  border-radius: 50%;
+  animation: dash-spin .8s linear infinite;
+}
+
+@keyframes dash-spin {
+  to { transform: rotate(360deg); }
+}
+
+/* Rodapé */
+
+.dashboard-page .dash-footer {
+  margin-top: 34px;
+  padding-top: 20px;
+  color: var(--dash-muted);
+  border-top: 1px solid var(--dash-border);
+  font-size: 12px;
+  line-height: 1.7;
+  text-align: center;
+}
+
+/* Tablet */
+
+@media (max-width: 1000px) {
+  .dashboard-page .dash-stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .dashboard-page .dash-savings-section {
+    grid-template-columns: 1fr;
+  }
+
+  .dashboard-page .dash-savings-footer {
+    grid-column: auto;
+  }
+}
+
+/* Celular */
+
+@media (max-width: 650px) {
+  .dashboard-page .dash-header {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 14px;
+    padding: 16px 18px;
+  }
+
+  .dashboard-page .dash-nav {
+    justify-content: flex-start;
+    width: 100%;
+  }
+
+  .dashboard-page .dash-nav-link,
+  .dashboard-page .dash-logout {
+    min-height: 37px;
+    padding: 8px 10px;
+    font-size: 12px;
+  }
+
+  .dashboard-page .dash-welcome,
+  .dashboard-page .dash-section,
+  .dashboard-page .dash-savings-section,
+  .dashboard-page .dash-error,
+  .dashboard-page .dash-footer {
+    width: calc(100% - 28px);
+  }
+
+  .dashboard-page .dash-welcome {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 22px;
+    margin-top: 18px;
+    padding: 25px 21px;
+    border-radius: 19px;
+  }
+
+  .dashboard-page .dash-welcome p {
+    font-size: 14px;
+  }
+
+  .dashboard-page .dash-primary-button {
+    width: 100%;
+  }
+
+  .dashboard-page .dash-section {
+    margin-top: 26px;
+  }
+
+  .dashboard-page .dash-section-heading {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .dashboard-page .dash-stat-grid {
+    gap: 11px;
+  }
+
+  .dashboard-page .dash-stat-card {
+    padding: 16px 14px;
+    border-radius: 15px;
+  }
+
+  .dashboard-page .dash-stat-top {
+    margin-bottom: 17px;
+  }
+
+  .dashboard-page .dash-stat-icon {
+    width: 38px;
+    height: 38px;
+    border-radius: 12px;
+    font-size: 18px;
+  }
+
+  .dashboard-page .dash-stat-value {
+    font-size: clamp(18px, 5vw, 25px);
+  }
+
+  .dashboard-page .dash-stat-label,
+  .dashboard-page .dash-stat-description {
+    font-size: 11px;
+  }
+
+  .dashboard-page .dash-savings-section {
+    gap: 22px;
+    margin-top: 22px;
+    padding: 22px 18px;
+    border-radius: 18px;
+  }
+
+  .dashboard-page .dash-savings-stats {
+    gap: 9px;
+  }
+
+  .dashboard-page .dash-savings-stat {
+    padding: 14px 11px;
+  }
+
+  .dashboard-page .dash-savings-footer {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .dashboard-page .dash-savings-button {
+    width: 100%;
+  }
+}
+
+@media (max-width: 360px) {
+  .dashboard-page .dash-stat-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .dashboard-page *,
+  .dashboard-page *::before,
+  .dashboard-page *::after {
+    animation-duration: .01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: .01ms !important;
+  }
+}

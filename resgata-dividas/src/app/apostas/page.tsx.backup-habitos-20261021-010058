@@ -1,0 +1,101 @@
+"use client";
+
+import Link from "next/link";
+import { useCallback, useEffect, useState, type FormEvent } from "react";
+import { useRouter } from "next/navigation";
+import { getSupabaseBrowserClient } from "@/lib/supabase";
+import type { GamblingSaving } from "@/types";
+
+const money = (value: number) =>
+  Number(value).toLocaleString("pt-BR", { style: "currency", currency: "BRL" });
+
+export default function ApostasPage() {
+  const router = useRouter();
+  const [items, setItems] = useState<GamblingSaving[]>([]);
+  const [amount, setAmount] = useState("");
+  const [observation, setObservation] = useState("");
+  const [error, setError] = useState("");
+  const [loading, setLoading] = useState(false);
+
+  const refresh = useCallback(async () => {
+    const supabase = getSupabaseBrowserClient();
+    const { data: auth } = await supabase.auth.getUser();
+
+    if (!auth.user) {
+      router.replace("/login");
+      return;
+    }
+
+    const { data, error } = await supabase
+      .from("gambling_savings")
+      .select("*")
+      .order("created_at", { ascending: false });
+
+    if (error) throw error;
+    setItems((data || []) as GamblingSaving[]);
+  }, [router]);
+
+  useEffect(() => {
+    void refresh().catch((err) =>
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Erro ao carregar histórico."
+      )
+    );
+  }, [refresh]);
+
+  async function add(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault(); setError(""); setLoading(true);
+    try {
+      const supabase = getSupabaseBrowserClient();
+      const { data: auth } = await supabase.auth.getUser();
+      if (!auth.user) { router.replace("/login"); return; }
+      const { error } = await supabase.from("gambling_savings").insert({
+        user_id: auth.user.id, amount_saved: Number(amount), observation: observation || null,
+      });
+      if (error) throw error;
+      setAmount(""); setObservation("");
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Não foi possível registrar.");
+    } finally { setLoading(false); }
+  }
+
+  async function remove(id: string) {
+    if (!window.confirm("Excluir este registro?")) return;
+    const { error } = await getSupabaseBrowserClient().from("gambling_savings").delete().eq("id", id);
+    if (error) setError(error.message);
+    else await refresh();
+  }
+
+  const total = items.reduce((sum, item) => sum + Number(item.amount_saved), 0);
+
+  return (
+    <main className="container page">
+      <nav className="nav"><Link className="brand" href="/">Resgata<span> Dívidas</span></Link><div className="navlinks"><Link href="/dashboard">Painel</Link><Link href="/dividas">Dívidas</Link><Link href="/perfil">Perfil</Link></div></nav>
+      <h1 style={{ fontSize: "2.5rem" }}>Meu progresso sem apostas</h1>
+      <div className="grid">
+        <section className="panel"><p className="muted">Total registrado como não apostado</p><div className="stat">{money(total)}</div></section>
+        <section className="panel"><p className="muted">Registros no histórico</p><div className="stat">{items.length}</div><p className="muted">O número de registros não representa dias consecutivos sem apostar.</p></section>
+      </div>
+      <div className="grid" style={{ marginTop: 16, gridTemplateColumns: "repeat(auto-fit,minmax(min(100%,320px),1fr))" }}>
+        <section className="panel"><h2>Novo registro</h2>
+          <form className="form" onSubmit={add}>
+            <label className="field">Valor que não apostou (R$)<input type="number" min="0.01" step="0.01" required value={amount} onChange={(e) => setAmount(e.target.value)} /></label>
+            <label className="field">Observação (opcional)<textarea maxLength={500} rows={3} value={observation} onChange={(e) => setObservation(e.target.value)} /></label>
+            <button className="btn primary" disabled={loading}>{loading ? "Salvando..." : "Registrar valor"}</button>
+          </form>
+        </section>
+        <section className="panel"><h2>Histórico</h2>
+          {error && <p className="error" role="alert">{error}</p>}
+          {items.length === 0 ? <p className="muted">Ainda não há registros.</p> : (
+            <div className="tablewrap"><table><thead><tr><th>Data</th><th>Valor</th><th>Observação</th><th>Ação</th></tr></thead><tbody>
+              {items.map((item) => <tr key={item.id}><td>{new Date(item.created_at).toLocaleDateString("pt-BR")}</td><td>{money(item.amount_saved)}</td><td>{item.observation || "—"}</td><td><button className="btn" onClick={() => void remove(item.id)}>Excluir</button></td></tr>)}
+            </tbody></table></div>
+          )}
+        </section>
+      </div>
+    </main>
+  );
+}

@@ -1,0 +1,1709 @@
+"use client";
+
+import Link from "next/link";
+import { useEffect, useRef, useState } from "react";
+import { useRouter } from "next/navigation";
+import { getSupabaseBrowserClient } from "@/lib/supabase";
+
+type Wallet = {
+  id: string;
+  name: string;
+  account_type: string;
+  balance: number | string;
+};
+
+type ImportKind = "divida" | "saldo";
+
+const money = (value: number) =>
+  value.toLocaleString("pt-BR", {
+    style: "currency",
+    currency: "BRL",
+  });
+
+function parseAmount(value: string): number {
+  let cleaned = value.replace(/[R$\s]/g, "");
+  if (cleaned.includes(",")) {
+    cleaned = cleaned.replace(/\./g, "").replace(",", ".");
+  }
+  return Number(cleaned);
+}
+
+function findAmount(text: string): string {
+  const matches = [
+    ...text.matchAll(
+      /(?:R\$\s*)?(\d{1,3}(?:\.\d{3})*,\d{2}|\d+,\d{2}|\d+\.\d{2})/g,
+    ),
+  ];
+  return matches.at(-1)?.[1]?.replace(/\./g, "").replace(",", ".") ?? "";
+}
+
+function findDate(text: string): string {
+  const match = text.match(/\b(\d{2})[\/.-](\d{2})[\/.-](\d{4})\b/);
+  if (!match) return "";
+  const [, day, month, year] = match;
+  const date = `${year}-${month}-${day}`;
+  const parsed = new Date(`${date}T12:00:00`);
+  return Number.isNaN(parsed.getTime()) ? "" :
+    parsed.toISOString().slice(0, 10);
+}
+
+function parseCSV(text: string): string[][] {
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let cell = "";
+  let quoted = false;
+
+  for (let i = 0; i < text.length; i++) {
+    const char = text[i];
+
+    if (char === '"' && quoted && text[i + 1] === '"') {
+      cell += '"';
+      i++;
+    } else if (char === '"') {
+      quoted = !quoted;
+    } else if ((char === "," || char === ";" || char === "\t") && !quoted) {
+      row.push(cell.trim());
+      cell = "";
+    } else if ((char === "\n" || char === "\r") && !quoted) {
+      if (char === "\r" && text[i + 1] === "\n") i++;
+      row.push(cell.trim());
+      if (row.some(Boolean)) rows.push(row);
+      row = [];
+      cell = "";
+    } else {
+      cell += char;
+    }
+  }
+
+  row.push(cell.trim());
+  if (row.some(Boolean)) rows.push(row);
+  return rows;
+}
+
+async function readDocument(file: File): Promise<string> {
+  const name = file.name.toLowerCase();
+
+  if (name.endsWith(".csv")) {
+    return await file.text();
+  }
+
+  if (name.endsWith(".xlsx") || name.endsWith(".xls")) {
+    const XLSX = await import("xlsx");
+    const workbook = XLSX.read(await file.arrayBuffer(), {
+      type: "array",
+      cellDates: true,
+    });
+
+    const firstSheetName = workbook.SheetNames[0];
+    if (!firstSheetName) {
+      throw new Error("A planilha Excel não contém abas.");
+    }
+
+    const sheet = workbook.Sheets[firstSheetName];
+    const csv = XLSX.utils.sheet_to_csv(sheet, { FS: ";", RS: "\n" });
+
+    if (!csv.trim()) {
+      throw new Error("A primeira aba da planilha não contém dados.");
+    }
+
+    return csv;
+  }
+
+  if (file.type.startsWith("image/")) {
+    const Tesseract = await import("tesseract.js");
+    const result = await Tesseract.recognize(file, "por+eng");
+    return result.data.text;
+  }
+
+  if (name.endsWith(".pdf") || file.type === "application/pdf") {
+    const pdfjs = await import("pdfjs-dist/legacy/build/pdf.mjs");
+    pdfjs.GlobalWorkerOptions.workerSrc =
+      `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjs.version}/pdf.worker.min.mjs`;
+
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const pdf = await pdfjs.getDocument({ data: bytes }).promise;
+    const pages: string[] = [];
+
+    for (let i = 1; i <= Math.min(pdf.numPages, 15); i++) {
+      const page = await pdf.getPage(i);
+      const content = await page.getTextContent();
+      pages.push(
+        content.items
+          .map((item) => ("str" in item ? item.str : ""))
+          .join(" "),
+      );
+    }
+
+    const text = pages.join("\n");
+    if (text.trim()) return text;
+
+    throw new Error(
+      "Este PDF não contém texto selecionável. Tire uma captura de tela ou envie uma imagem para usar o OCR.",
+    );
+  }
+
+  throw new Error("Formato não suportado. Envie PDF, JPG, PNG, CSV, XLSX ou XLS.");
+}
+
+
+function buildCsvDebtRows(
+  text: string,
+  userId: string,
+  reviewedRows?: string[][],
+) {
+  const rows = reviewedRows?.length ? reviewedRows : parseCSV(text);
+  if (rows.length < 2) return [];
+
+  const normalize = (value: string) =>
+    value.normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .toLowerCase()
+      .replace(/[_-]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const headers = rows[0].map(normalize);
+
+  const findColumn = (patterns: RegExp[]) =>
+    headers.findIndex((header) =>
+      patterns.some((pattern) => pattern.test(header))
+    );
+
+  const amountIndex = findColumn([
+    /^valor da divida$/,
+    /^valor devido$/,
+    /^valor a pagar$/,
+    /^valor em aberto$/,
+    /^valor da conta$/,
+    /^valor original$/,
+    /^valor (r\$)?$/,
+    /^vl$/,
+    /^amount due$/,
+    /^debt amount$/,
+    /^amount$/,
+  ]);
+
+  const dateIndex = findColumn([
+    /^vencimento$/,
+    /^data de vencimento$/,
+    /^dia de vencimento$/,
+    /^data limite$/,
+    /^due date$/,
+    /^due$/,
+  ]);
+
+  const nameIndex = findColumn([
+    /^descricao$/,
+    /^nome da conta$/,
+    /^nome$/,
+    /^conta$/,
+    /^servico$/,
+    /^historico$/,
+    /^description$/,
+  ]);
+
+  const creditorIndex = findColumn([
+    /^credor$/,
+    /^empresa$/,
+    /^instituicao$/,
+    /^fornecedor$/,
+    /^prestador$/,
+    /^quem$/,
+    /^creditor$/,
+  ]);
+
+  const statusIndex = findColumn([
+    /^status$/,
+    /^situacao$/,
+    /^situacao do pagamento$/,
+    /^status do pagamento$/,
+    /^pago$/,
+    /^pagamento$/,
+    /^payment status$/,
+  ]);
+
+  // Não tratar saldo bancário, total geral ou valor já pago como dívida.
+  if (amountIndex < 0) return [];
+
+  const result: {
+    user_id: string;
+    name: string;
+    creditor: string;
+    amount: number;
+    due_date: string | null;
+    category: string;
+    priority: string;
+    status: string;
+  }[] = [];
+
+  const seen = new Set<string>();
+
+  for (const row of rows.slice(1)) {
+    const rawAmount = row[amountIndex] ?? "";
+    const amount = parseAmount(rawAmount);
+
+    if (!rawAmount.trim() || !Number.isFinite(amount) || amount <= 0) {
+      continue;
+    }
+
+    const name = (nameIndex >= 0 ? row[nameIndex] : "").trim();
+    const creditor = (creditorIndex >= 0 ? row[creditorIndex] : "").trim();
+
+    // Não inventar descrição ou credor: dados incompletos devem ser corrigidos.
+    if (!name || !creditor) continue;
+
+    const rawDate = dateIndex >= 0 ? (row[dateIndex] ?? "").trim() : "";
+    let dueDate: string | null = null;
+
+    if (/^\d{4}-\d{2}-\d{2}$/.test(rawDate)) {
+      const parsed = new Date(`${rawDate}T12:00:00`);
+      if (
+        !Number.isNaN(parsed.getTime()) &&
+        parsed.toISOString().slice(0, 10) === rawDate
+      ) {
+        dueDate = rawDate;
+      }
+    } else if (rawDate) {
+      dueDate = findDate(rawDate) || null;
+    }
+
+    let status = "pendente";
+    const rawStatus = statusIndex >= 0
+      ? normalize(row[statusIndex] ?? "")
+      : "";
+
+    if (/^(pago|paga|quitado|quitada|sim|yes|paid)$/.test(rawStatus)) {
+      status = "pago";
+    } else if (
+      /^(atrasado|atrasada|vencido|vencida|em atraso|overdue)$/.test(rawStatus)
+    ) {
+      status = "atrasado";
+    }
+
+    const key = [
+      normalize(name),
+      normalize(creditor),
+      amount.toFixed(2),
+      dueDate ?? "",
+    ].join("|");
+
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    result.push({
+      user_id: userId,
+      name,
+      creditor,
+      amount,
+      due_date: dueDate,
+      category: "outra",
+      priority: "normal",
+      status,
+    });
+  }
+
+  return result;
+}
+
+export default function DocumentosPage() {
+  const router = useRouter();
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  const [userId, setUserId] = useState("");
+  const [wallets, setWallets] = useState<Wallet[]>([]);
+  const [kind, setKind] = useState<ImportKind>("divida");
+  const [walletId, setWalletId] = useState("");
+  const [fileName, setFileName] = useState("");
+  const [selectedFileUrl, setSelectedFileUrl] = useState("");
+  const [selectedFileType, setSelectedFileType] = useState("");
+  const [sourceFile, setSourceFile] = useState<File | null>(null);
+  const [selectionStart, setSelectionStart] = useState<{ x: number; y: number } | null>(null);
+  const [selectionEnd, setSelectionEnd] = useState<{ x: number; y: number } | null>(null);
+  const [imageNaturalSize, setImageNaturalSize] = useState({ width: 0, height: 0 });
+  const imageRef = useRef<HTMLImageElement>(null);
+  const selectingRef = useRef(false);
+  const [extractedText, setExtractedText] = useState("");
+  const [name, setName] = useState("");
+  const [creditor, setCreditor] = useState("");
+  const [amount, setAmount] = useState("");
+  const [date, setDate] = useState("");
+  const [loading, setLoading] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [message, setMessage] = useState("");
+  const [error, setError] = useState("");
+  const [csvRows, setCsvRows] = useState<string[][]>([]);
+  const [visibleColumns, setVisibleColumns] = useState<number[]>([]);
+  const [reviewReady, setReviewReady] = useState(false);
+
+  useEffect(() => {
+    if (!selectedFileUrl) return;
+    return () => URL.revokeObjectURL(selectedFileUrl);
+  }, [selectedFileUrl]);
+
+  useEffect(() => {
+    let active = true;
+
+    async function load() {
+      const supabase = getSupabaseBrowserClient();
+      const { data, error: authError } = await supabase.auth.getUser();
+
+      if (!active) return;
+      if (authError || !data.user) {
+        router.replace("/login");
+        return;
+      }
+
+      setUserId(data.user.id);
+
+      const { data: accounts, error: accountError } = await supabase
+        .from("wallet_accounts")
+        .select("id,name,account_type,balance")
+        .eq("user_id", data.user.id)
+        .order("created_at", { ascending: true });
+
+      if (!active) return;
+
+      if (accountError) {
+        setError("Não foi possível carregar suas contas financeiras.");
+        return;
+      }
+
+      setWallets((accounts ?? []) as Wallet[]);
+      if (accounts?.length) setWalletId(accounts[0].id);
+    }
+
+    void load();
+    return () => {
+      active = false;
+    };
+  }, [router]);
+
+  async function handleFile(file?: File) {
+    if (!file) return;
+
+    const spreadsheetFile =
+      /\.(csv|xlsx|xls)$/i.test(file.name) ||
+      /spreadsheet|excel|text\/csv/i.test(file.type);
+
+    if (spreadsheetFile) {
+      setError(
+        "Importação de planilhas temporariamente indisponível. Utilize um arquivo PDF ou uma foto do documento."
+      );
+      setMessage("");
+      setReviewReady(false);
+      setSourceFile(null);
+      setExtractedText("");
+      setCsvRows([]);
+      setFileName("");
+      setSelectionStart(null);
+      setSelectionEnd(null);
+      setLoading(false);
+      if (inputRef.current) inputRef.current.value = "";
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    setMessage("");
+    setFileName(file.name);
+    setSourceFile(file);
+    setSelectionStart(null);
+    setSelectionEnd(null);
+   setSelectedFileUrl(URL.createObjectURL(file));
+   setSelectedFileType(
+     file.type ||
+       (file.name.toLowerCase().endsWith(".pdf")
+         ? "application/pdf"
+         : file.name.toLowerCase().endsWith(".csv")
+           ? "text/csv"
+           : ""),
+   );
+    setExtractedText("");
+    setCsvRows([]);
+    setReviewReady(false);
+
+    try {
+      const text = await readDocument(file);
+      setExtractedText(text);
+
+      if (/\.(csv|xlsx|xls)$/i.test(file.name)) {
+        const rows = parseCSV(text);
+        setCsvRows(rows);
+       setVisibleColumns(rows[0].map((_, index) => index));
+
+        if (rows.length > 1) {
+          setMessage(
+            `CSV lido: ${rows.length - 1} linhas de dados. Confira a tabela antes de importar.`,
+          );
+
+          const headers = rows[0].map((h) => h.toLowerCase());
+          const amountIndex = headers.findIndex((h) =>
+            /valor|saldo|amount|total/.test(h),
+          );
+          const dateIndex = headers.findIndex((h) =>
+            /data|vencimento|date/.test(h),
+          );
+          const descriptionIndex = headers.findIndex((h) =>
+            /descri|nome|credor|hist.rico|description/.test(h),
+          );
+
+          const first = rows[1];
+          if (amountIndex >= 0 && first[amountIndex]) {
+            setAmount(String(parseAmount(first[amountIndex])));
+          }
+          if (dateIndex >= 0 && first[dateIndex]) {
+            setDate(findDate(first[dateIndex]) || first[dateIndex]);
+          }
+          if (descriptionIndex >= 0 && first[descriptionIndex]) {
+            setName(first[descriptionIndex]);
+            setCreditor(first[descriptionIndex]);
+          }
+        } else {
+          setError("O CSV não contém linhas de dados suficientes.");
+        }
+      } else {
+        setAmount(findAmount(text));
+        setDate(findDate(text));
+
+        const lines = text
+          .split(/\r?\n/)
+          .map((line) => line.trim())
+          .filter(Boolean);
+
+        const candidate = lines.find(
+          (line) =>
+            line.length >= 3 &&
+            !/R\$|saldo|vencimento|vencida|pagamento|extrato/i.test(line),
+        );
+
+        if (candidate) {
+          setName(candidate.slice(0, 100));
+          setCreditor(candidate.slice(0, 100));
+        }
+
+        setMessage(
+          "Leitura concluída. Confira e corrija os campos antes de salvar.",
+        );
+      }
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Não foi possível ler o documento.",
+      );
+    } finally {
+      setLoading(false);
+    }
+  }
+
+
+  async function saveReviewedData() {
+    if (!reviewReady || !fileName) {
+      setError("Primeiro prepare e confira o arquivo.");
+      return;
+    }
+
+    if (kind !== "divida") {
+      setError(
+        "A gravação de saldo está desativada nesta etapa para proteger sua conta financeira."
+      );
+      return;
+    }
+
+    setSaving(true);
+    setError("");
+    setMessage("");
+
+    try {
+      const supabase = getSupabaseBrowserClient();
+      const { data: auth, error: authError } = await supabase.auth.getUser();
+
+      if (authError) throw authError;
+
+      if (!auth.user) {
+        router.replace("/login");
+        return;
+      }
+
+      const currentUserId = auth.user.id;
+
+      type DebtInsert = {
+        user_id: string;
+        name: string;
+        creditor: string;
+        amount: number;
+        due_date: string;
+        category: string;
+        priority: string;
+        status: string;
+      };
+
+      let records: DebtInsert[] = [];
+
+      if (csvRows.length > 1) {
+        // Só importa colunas identificadas como valor da dívida.
+        // Não trata VL, TOT, saldo ou F.PAG isoladamente como dívida.
+        const parsed = buildCsvDebtRows(extractedText, currentUserId, csvRows);
+
+        if (parsed.length === 0) {
+          throw new Error(
+            "Nenhuma dívida válida foi identificada. Confira as colunas de descrição, credor e valor."
+          );
+        }
+
+        const invalidDates = parsed.filter((item) => {
+          if (!item.due_date || !/^\d{4}-\d{2}-\d{2}$/.test(item.due_date)) {
+            return true;
+          }
+
+          const parsedDate = new Date(`${item.due_date}T12:00:00`);
+          return (
+            Number.isNaN(parsedDate.getTime()) ||
+            parsedDate.toISOString().slice(0, 10) !== item.due_date
+          );
+        });
+
+        if (invalidDates.length > 0) {
+          throw new Error(
+            `${invalidDates.length} conta(s) estão sem vencimento válido. Corrija a coluna de vencimento na tabela e confirme novamente. Nenhuma dívida foi salva nesta tentativa.`
+          );
+        }
+
+        records = parsed.map((item) => ({
+          ...item,
+          due_date: item.due_date as string,
+        }));
+      } else {
+        const cleanName = name.trim();
+        const cleanCreditor = creditor.trim();
+        const numericAmount = parseAmount(amount);
+        const dueDate = date.trim();
+
+        if (!cleanName || !cleanCreditor) {
+          throw new Error("Preencha a descrição e o credor antes de salvar.");
+        }
+
+        if (!Number.isFinite(numericAmount) || numericAmount <= 0) {
+          throw new Error("Informe um valor válido maior que zero.");
+        }
+
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(dueDate)) {
+          throw new Error(
+            "Informe uma data de vencimento válida no formato AAAA-MM-DD."
+          );
+        }
+
+        const parsedDate = new Date(`${dueDate}T12:00:00`);
+        if (
+          Number.isNaN(parsedDate.getTime()) ||
+          parsedDate.toISOString().slice(0, 10) !== dueDate
+        ) {
+          throw new Error("A data de vencimento não é válida.");
+        }
+
+        records = [{
+          user_id: currentUserId,
+          name: cleanName,
+          creditor: cleanCreditor,
+          amount: numericAmount,
+          due_date: dueDate,
+          category: "outra",
+          priority: "normal",
+          status: "pendente",
+        }];
+      }
+
+      if (records.length === 0) {
+        throw new Error(
+          "Nenhuma dívida válida foi identificada. Para importar uma planilha, ela precisa ter uma coluna de valor com cabeçalho reconhecido, descrição/credor e vencimento. Confira os nomes das colunas e as datas."
+        );
+      }
+
+      // Consulta os registros do usuário para evitar duplicatas óbvias.
+      const { data: existing, error: existingError } = await supabase
+        .from("debts")
+        .select("name,creditor,amount,due_date")
+        .eq("user_id", currentUserId);
+
+      if (existingError) throw existingError;
+
+      const normalize = (value: string) =>
+        value.normalize("NFD")
+          .replace(/[\u0300-\u036f]/g, "")
+          .trim()
+          .toLowerCase();
+
+      const duplicateKey = (item: {
+        name: string;
+        creditor: string;
+        amount: number | string;
+        due_date: string;
+      }) => [
+        normalize(item.name),
+        normalize(item.creditor),
+        Number(item.amount).toFixed(2),
+        item.due_date,
+      ].join("|");
+
+      const known = new Set(
+        ((existing ?? []) as {
+          name: string;
+          creditor: string;
+          amount: number | string;
+          due_date: string;
+        }[]).map((item) =>
+          duplicateKey({
+            name: item.name,
+            creditor: item.creditor,
+            amount: item.amount,
+            due_date: item.due_date,
+          })
+        )
+      );
+
+      const seenInFile = new Set<string>();
+      const uniqueRecords = records.filter((item) => {
+        const key = duplicateKey(item);
+
+        if (known.has(key) || seenInFile.has(key)) return false;
+
+        seenInFile.add(key);
+        return true;
+      });
+
+      if (uniqueRecords.length === 0) {
+        setMessage(
+          "Nenhuma dívida nova foi salva: os registros já existem no sistema ou estão repetidos no arquivo."
+        );
+        return;
+      }
+
+      const { error: insertError } = await supabase
+        .from("debts")
+        .insert(uniqueRecords);
+
+      if (insertError) throw insertError;
+
+      setMessage(
+        `${uniqueRecords.length} dívida(s) salva(s) com sucesso. ${
+          records.length - uniqueRecords.length
+        } registro(s) repetido(s) foram ignorados. Consulte a página Dívidas para conferir.`
+      );
+    } catch (err) {
+      setError(
+        err instanceof Error
+          ? err.message
+          : "Não foi possível salvar os registros."
+      );
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  function prepareSpreadsheet(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setError("");
+    setMessage("");
+
+    if (!fileName) {
+      setError("Selecione um arquivo para visualizar os dados.");
+      return;
+    }
+
+    setReviewReady(true);
+
+    if (csvRows.length > 1) {
+      setMessage(
+        `Planilha preparada para visualização: ${csvRows.length - 1} linhas de dados. Nada foi salvo.`
+      );
+    } else if (extractedText.trim()) {
+      setMessage("Arquivo preparado para visualização. Nada foi salvo.");
+    } else {
+      setMessage(
+        "Arquivo selecionado. Não foi possível identificar dados para exibir."
+      );
+    }
+  }
+
+  return (
+    <main style={{
+      minHeight: "100vh",
+      background: "radial-gradient(ellipse at 8% 5%, rgba(59,130,246,.20), transparent 34%), radial-gradient(ellipse at 92% 12%, rgba(20,184,166,.20), transparent 32%), radial-gradient(ellipse at 70% 90%, rgba(139,92,246,.12), transparent 36%), linear-gradient(135deg, #edf4ff 0%, #eefaf8 48%, #f4f1ff 100%)",
+      color: "#172033",
+      padding: "32px 16px 56px",
+    }}>
+      <div style={{ maxWidth: 1180, margin: "0 auto" }}>
+        <header style={{
+          display: "flex",
+          flexWrap: "wrap",
+          alignItems: "center",
+          justifyContent: "space-between",
+          gap: 16,
+          marginBottom: 30,
+          paddingBottom: 22,
+          borderBottom: "1px solid rgba(148,163,184,.35)",
+        }}>
+          <div>
+            <Link href="/dashboard" style={{
+              color: "#087e8b",
+              textDecoration: "none",
+              fontWeight: 800,
+              display: "inline-flex",
+              alignItems: "center",
+              gap: 8,
+              padding: "9px 14px",
+              borderRadius: 999,
+              background: "rgba(255,255,255,.82)",
+              border: "1px solid rgba(8,126,139,.18)",
+            }}>
+              ← Voltar ao painel
+            </Link>
+            <h1 style={{ margin: "14px 0 8px", fontSize: "clamp(30px, 4vw, 40px)", fontWeight: 850, letterSpacing: "-1.4px", color: "#172033", lineHeight: 1.12 }}>
+              Documentos
+            </h1>
+            <p style={{ margin: 0, color: "#64748b", lineHeight: 1.6 }}>
+              Extraia valores e datas sem arquivar os documentos originais.
+            </p>
+          </div>
+          <nav style={{ display: "flex", flexWrap: "wrap", gap: 10, alignItems: "center" }}>
+            <Link href="/dividas" style={{
+              textDecoration: "none",
+              color: "#334155",
+              fontWeight: 750,
+              padding: "11px 16px",
+              borderRadius: 12,
+              background: "rgba(255,255,255,.88)",
+              border: "1px solid #dbe5ef",
+              boxShadow: "0 4px 12px rgba(15,23,42,.04)",
+            }}>Dívidas</Link>
+            <Link href="/financeiro" style={{
+              textDecoration: "none",
+              color: "#fff",
+              fontWeight: 750,
+              padding: "11px 16px",
+              borderRadius: 12,
+              background: "linear-gradient(135deg, #0f766e, #0e7490)",
+              boxShadow: "0 6px 16px rgba(15,118,110,.20)",
+            }}>Finanças</Link>
+          </nav>
+        </header>
+
+        <section style={{
+          background: "rgba(255,255,255,.96)",
+          border: "1px solid rgba(255,255,255,.95)",
+          borderRadius: 24,
+          padding: "clamp(20px, 4vw, 34px)",
+          boxShadow: "0 22px 60px rgba(30,64,110,.12), 0 3px 10px rgba(15,23,42,.04)",
+        }}>
+          <h2 style={{ marginTop: 0, marginBottom: 10, fontSize: 22, fontWeight: 800, letterSpacing: "-.5px", color: "#172033" }}>1. Envie um documento</h2>
+          <p style={{ color: "#64748b", lineHeight: 1.6 }}>
+            Formatos disponíveis: PDF, JPG, PNG e WEBP. A leitura pode exigir
+            conexão com a internet para carregar os recursos de OCR.
+          </p>
+
+          <input
+            ref={inputRef}
+            type="file"
+            accept=".pdf,.jpg,.jpeg,.png,.webp,application/pdf,image/*"
+            onChange={(event) => void handleFile(event.target.files?.[0])}
+            style={{ display: "none" }}
+          />
+
+          <div style={{
+            display: "grid",
+            gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))",
+            gap: 14,
+            marginTop: 20,
+          }}>
+            {[
+              {
+                title: "PDF",
+                description: "Contas, faturas e boletos",
+                icon: "📄",
+                accept: ".pdf,application/pdf",
+                background: "linear-gradient(135deg, #fff1f2, #ffe4e6)",
+                border: "#fecdd3",
+                color: "#9f1239",
+              },
+              {
+                title: "Fotos e imagens",
+                description: "JPG, PNG e WEBP",
+                icon: "🖼️",
+                accept: ".jpg,.jpeg,.png,.webp,image/*",
+                background: "linear-gradient(135deg, #eff6ff, #dbeafe)",
+                border: "#bfdbfe",
+                color: "#1d4ed8",
+              },
+              {
+                title: "Selecionar arquivo",
+                description: "Escolha um PDF ou uma foto",
+                icon: "📁",
+                accept: ".pdf,.jpg,.jpeg,.png,.webp,application/pdf,image/*",
+                background: "linear-gradient(135deg, #faf5ff, #f3e8ff)",
+                border: "#e9d5ff",
+                color: "#7e22ce",
+              },
+            ].map((item) => (
+              <button
+                key={item.title}
+                type="button"
+                onClick={() => {
+                  if (!inputRef.current || loading || saving) return;
+                  inputRef.current.accept = item.accept;
+                  inputRef.current.click();
+                }}
+                disabled={loading || saving}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 14,
+                  width: "100%",
+                  minHeight: 112,
+                  padding: 18,
+                  textAlign: "left",
+                  border: `1px solid ${item.border}`,
+                  borderRadius: 18,
+                  background: item.background,
+                  color: item.color,
+                  cursor: loading || saving ? "wait" : "pointer",
+                  boxShadow: "0 6px 16px rgba(15,23,42,.05)",
+                }}
+              >
+                <span aria-hidden="true" style={{ fontSize: 32 }}>
+                  {item.icon}
+                </span>
+                <span>
+                  <span style={{ display: "block", fontSize: 16, fontWeight: 850 }}>
+                    {item.title}
+                  </span>
+                  <span style={{ display: "block", marginTop: 5, fontSize: 12, lineHeight: 1.5 }}>
+                    {item.description}
+                  </span>
+                </span>
+              </button>
+            ))}
+          </div>
+
+          <p style={{
+            marginTop: 14,
+            color: "#64748b",
+            fontSize: 13,
+            lineHeight: 1.6,
+          }}>
+            Selecione um cartão, escolha o arquivo no seu dispositivo e confira
+            a visualização antes de importar os dados.
+          </p>
+
+          {selectedFileUrl && (
+           <section
+             aria-label="Visualização do arquivo enviado"
+             style={{
+               marginTop: 24,
+               padding: "clamp(16px, 3vw, 24px)",
+               borderRadius: 20,
+               border: "1px solid #cbdcf0",
+               background: "linear-gradient(135deg, #eff6ff, #f0fdfa)",
+               boxShadow: "0 10px 28px rgba(30,64,110,.08)",
+             }}
+           >
+             <div style={{
+               display: "flex",
+               flexWrap: "wrap",
+               alignItems: "center",
+               justifyContent: "space-between",
+               gap: 12,
+               marginBottom: 16,
+             }}>
+               <div>
+                 <h2 style={{ margin: 0, color: "#172033", fontSize: 21 }}>
+                   Visualizar arquivo
+                 </h2>
+                 <p style={{ margin: "6px 0 0", color: "#64748b", fontSize: 14 }}>
+                   Confira o documento original antes de importar os dados.
+                 </p>
+               </div>
+               <span style={{
+                 padding: "7px 11px",
+                 borderRadius: 999,
+                 background: "#dbeafe",
+                 color: "#1d4ed8",
+                 fontSize: 12,
+                 fontWeight: 800,
+               }}>
+                 {selectedFileType === "application/pdf" ||
+                 fileName.toLowerCase().endsWith(".pdf")
+                   ? "PDF"
+                   : selectedFileType.startsWith("image/") ||
+                       /\.(jpg|jpeg|png|webp|gif)$/i.test(fileName)
+                     ? "IMAGEM"
+                     : /\.xlsx$/i.test(fileName)
+                    ? "XLSX"
+                    : /\.xls$/i.test(fileName)
+                      ? "XLS"
+                      : fileName.toLowerCase().endsWith(".csv")
+                        ? "CSV"
+                        : "DOCUMENTO"}
+               </span>
+             </div>
+
+             {(selectedFileType.startsWith("image/") ||
+               /\.(jpg|jpeg|png|webp|gif)$/i.test(fileName)) ? (
+                <>
+               <div style={{
+                 display: "flex",
+                 justifyContent: "center",
+                 padding: 12,
+                 background: "#fff",
+                 border: "1px solid #dbe5ef",
+                 borderRadius: 14,
+                 overflow: "auto",
+               }}>
+                 <div
+                   style={{
+                     position: "relative",
+                     display: "inline-block",
+                     maxWidth: "100%",
+                     lineHeight: 0,
+                     cursor: "crosshair",
+                     touchAction: "none",
+                   }}
+                   onPointerDown={(event) => {
+                     const rect = event.currentTarget.getBoundingClientRect();
+                     const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+                     const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+                     selectingRef.current = true;
+                     setSelectionStart({ x, y });
+                     setSelectionEnd({ x, y });
+                     event.currentTarget.setPointerCapture(event.pointerId);
+                   }}
+                   onPointerMove={(event) => {
+                     if (!selectingRef.current) return;
+                     const rect = event.currentTarget.getBoundingClientRect();
+                     const x = Math.max(0, Math.min(1, (event.clientX - rect.left) / rect.width));
+                     const y = Math.max(0, Math.min(1, (event.clientY - rect.top) / rect.height));
+                     setSelectionEnd({ x, y });
+                   }}
+                   onPointerUp={() => {
+                     selectingRef.current = false;
+                   }}
+                   onPointerCancel={() => {
+                     selectingRef.current = false;
+                   }}
+                 >
+                   <img
+                     ref={imageRef}
+                     src={selectedFileUrl}
+                     alt={`Pré-visualização de ${fileName}`}
+                     onLoad={(event) => setImageNaturalSize({
+                       width: event.currentTarget.naturalWidth,
+                       height: event.currentTarget.naturalHeight,
+                     })}
+                     draggable={false}
+                     style={{
+                       display: "block",
+                       maxWidth: "100%",
+                       width: "100%",
+                       maxHeight: 650,
+                       objectFit: "contain",
+                       borderRadius: 8,
+                       userSelect: "none",
+                     }}
+                   />
+                   {selectionStart && selectionEnd && (
+                     <div
+                       style={{
+                         position: "absolute",
+                         left: `${Math.min(selectionStart.x, selectionEnd.x) * 100}%`,
+                         top: `${Math.min(selectionStart.y, selectionEnd.y) * 100}%`,
+                         width: `${Math.abs(selectionEnd.x - selectionStart.x) * 100}%`,
+                         height: `${Math.abs(selectionEnd.y - selectionStart.y) * 100}%`,
+                         border: "2px solid #2563eb",
+                         background: "rgba(59,130,246,.18)",
+                         boxSizing: "border-box",
+                         pointerEvents: "none",
+                       }}
+                     />
+                   )}
+                 </div>
+               </div>
+                 <div style={{ marginTop: 12, width: "100%", lineHeight: 1.5 }}>
+                   <p style={{ margin: "0 0 8px", color: "#334155", fontSize: 14 }}>
+                     Arraste o mouse ou o dedo sobre a imagem para marcar somente a área da conta que deseja ler.
+                   </p>
+                   <button
+                     type="button"
+                     disabled={loading || !sourceFile || !selectionStart || !selectionEnd ||
+                       Math.abs(selectionEnd.x - selectionStart.x) < 0.01 ||
+                       Math.abs(selectionEnd.y - selectionStart.y) < 0.01}
+                     onClick={async () => {
+                       const image = imageRef.current;
+                       if (!image || !sourceFile || !selectionStart || !selectionEnd) return;
+
+                       const left = Math.min(selectionStart.x, selectionEnd.x);
+                       const top = Math.min(selectionStart.y, selectionEnd.y);
+                       const width = Math.abs(selectionEnd.x - selectionStart.x);
+                       const height = Math.abs(selectionEnd.y - selectionStart.y);
+
+                       if (width < 0.01 || height < 0.01) {
+                         setError("Marque uma área maior na imagem.");
+                         return;
+                       }
+
+                       setLoading(true);
+                       setError("");
+                       setMessage("");
+
+                       try {
+                         const canvas = document.createElement("canvas");
+                         canvas.width = Math.round(width * imageNaturalSize.width);
+                         canvas.height = Math.round(height * imageNaturalSize.height);
+                         const context = canvas.getContext("2d");
+                         if (!context || !canvas.width || !canvas.height) {
+                           throw new Error("Não foi possível preparar a área selecionada.");
+                         }
+
+                         context.drawImage(
+                           image,
+                           Math.round(left * imageNaturalSize.width),
+                           Math.round(top * imageNaturalSize.height),
+                           canvas.width,
+                           canvas.height,
+                           0,
+                           0,
+                           canvas.width,
+                           canvas.height,
+                         );
+
+                         const blob = await new Promise<Blob>((resolve, reject) => {
+                           canvas.toBlob((value) => {
+                             if (value) resolve(value);
+                             else reject(new Error("Não foi possível recortar a imagem."));
+                           }, "image/png");
+                         });
+
+                         const Tesseract = await import("tesseract.js");
+                         const result = await Tesseract.recognize(blob, "por+eng");
+                         const text = result.data.text.trim();
+
+                         if (!text) {
+                           throw new Error("Não foi possível ler texto nessa região. Tente marcar uma área maior e mais nítida.");
+                         }
+
+                         setExtractedText(text);
+                         setCsvRows([]);
+                         setVisibleColumns([]);
+                         setAmount(findAmount(text));
+                         setDate(findDate(text));
+
+                         const lines = text.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+                         const candidate = lines.find((line) =>
+                           line.length >= 3 &&
+                           !/R\$|saldo|vencimento|vencida|pagamento|extrato/i.test(line)
+                         );
+
+                         if (candidate) {
+                           setName(candidate.slice(0, 100));
+                           setCreditor(candidate.slice(0, 100));
+                         }
+
+                         setReviewReady(false);
+                         setMessage("Área selecionada lida. Confira e corrija os dados antes de confirmar o salvamento.");
+                       } catch (err) {
+                         setError(err instanceof Error ? err.message : "Falha ao ler a área selecionada.");
+                       } finally {
+                         setLoading(false);
+                       }
+                     }}
+                     style={{
+                       border: 0,
+                       borderRadius: 10,
+                       padding: "11px 16px",
+                       background: "#2563eb",
+                       color: "#fff",
+                       fontWeight: 750,
+                       cursor: "pointer",
+                       opacity: loading ? 0.6 : 1,
+                     }}
+                   >
+                     Ler somente a área selecionada
+                   </button>
+                   <button
+                     type="button"
+                     onClick={() => {
+                       setSelectionStart(null);
+                       setSelectionEnd(null);
+                     }}
+                     style={{
+                       marginLeft: 8,
+                       border: "1px solid #cbd5e1",
+                       borderRadius: 10,
+                       padding: "10px 14px",
+                       background: "#fff",
+                       color: "#334155",
+                       fontWeight: 650,
+                       cursor: "pointer",
+                     }}
+                   >
+                     Limpar seleção
+                   </button>
+                 </div>
+                </>
+              ) : selectedFileType === "application/pdf" ||
+                 fileName.toLowerCase().endsWith(".pdf") ? (
+               <iframe
+                 title={`Pré-visualização de ${fileName}`}
+                 src={selectedFileUrl}
+                 style={{
+                   display: "block",
+                   width: "100%",
+                   height: 600,
+                   border: "1px solid #dbe5ef",
+                   borderRadius: 14,
+                   background: "#fff",
+                 }}
+               />
+             ) : (
+               <div style={{
+                 padding: 16,
+                 background: "#fff",
+                 border: "1px solid #dbe5ef",
+                 borderRadius: 14,
+                 color: "#334155",
+               }}>
+                 <div style={{
+                   display: "flex",
+                   flexWrap: "wrap",
+                   justifyContent: "space-between",
+                   alignItems: "center",
+                   gap: 8,
+                   marginBottom: 12,
+                 }}>
+                   <div>
+                     <h3 style={{ margin: 0, fontSize: 17, color: "#172033" }}>
+                       Pré-visualização da planilha
+                     </h3>
+                     <p style={{ margin: "5px 0 0", color: "#64748b", fontSize: 13 }}>
+                       {csvRows.length > 1
+                         ? `${csvRows.length - 1} linha(s) de dados · ${csvRows[0]?.length || 0} coluna(s)`
+                         : "Nenhuma tabela reconhecida neste arquivo."}
+                     </p>
+                   </div>
+                   <span style={{
+                     padding: "6px 10px",
+                     borderRadius: 999,
+                     background: "#dcfce7",
+                     color: "#166534",
+                     fontSize: 12,
+                     fontWeight: 800,
+                   }}>
+                     SOMENTE VISUALIZAÇÃO
+                   </span>
+                 </div>
+
+                 {csvRows.length > 0 ? (
+                   <div style={{
+                     maxHeight: 420,
+                     overflow: "auto",
+                     border: "1px solid #dbe5ef",
+                     borderRadius: 10,
+                   }}>
+                     <table style={{
+                       width: "100%",
+                       minWidth: 560,
+                       borderCollapse: "collapse",
+                       fontSize: 13,
+                     }}>
+                       <thead>
+                         <tr style={{
+                           position: "sticky",
+                           top: 0,
+                           background: "#e0f2fe",
+                           color: "#164e63",
+                           zIndex: 1,
+                         }}>
+                           {(csvRows[0] || []).map((heading, index) => (
+                             <th key={index} style={{
+                               padding: "11px 12px",
+                               borderBottom: "1px solid #cbd5e1",
+                               textAlign: "left",
+                               whiteSpace: "nowrap",
+                             }}>
+                               {heading || `Coluna ${index + 1}`}
+                             </th>
+                           ))}
+                         </tr>
+                       </thead>
+                       <tbody>
+                         {csvRows.slice(1, 101).map((row, rowIndex) => (
+                           <tr key={rowIndex} style={{
+                             background: rowIndex % 2 ? "#f8fafc" : "#fff",
+                           }}>
+                             {(csvRows[0] || []).map((_, columnIndex) => (
+                               <td key={columnIndex} style={{
+                                 padding: "10px 12px",
+                                 borderBottom: "1px solid #e2e8f0",
+                                 whiteSpace: "pre-wrap",
+                                 overflowWrap: "anywhere",
+                                 maxWidth: 320,
+                               }}>
+                                 {row[columnIndex] || "—"}
+                               </td>
+                             ))}
+                           </tr>
+                         ))}
+                       </tbody>
+                     </table>
+                   </div>
+                 ) : (
+                   <p style={{ margin: 0, color: "#64748b", lineHeight: 1.6 }}>
+                     Não foi possível montar uma tabela para este arquivo. Confira
+                     se ele contém dados e se a primeira aba da planilha está preenchida.
+                   </p>
+                 )}
+
+                 {csvRows.length > 101 && (
+                   <p style={{ margin: "8px 0 0", color: "#64748b", fontSize: 12 }}>
+                     Mostrando as primeiras 100 linhas de dados nesta prévia.
+                   </p>
+                 )}
+
+                 <p style={{
+                   margin: "12px 0 0",
+                   color: "#64748b",
+                   fontSize: 13,
+                   lineHeight: 1.5,
+                 }}>
+                   Esta prévia não altera nem salva os dados. Para editar os valores,
+                   utilize a seção “Conferir e importar” abaixo.
+                 </p>
+               </div>
+             )}
+           </section>
+         )}
+
+         {fileName && (
+            <p style={{ color: "#64748b", overflowWrap: "anywhere" }}>
+              Arquivo em processamento: <strong>{fileName}</strong>
+            </p>
+          )}
+          {loading && <p role="status">Lendo documento. Aguarde...</p>}
+          {error && (
+            <p role="alert" style={{
+              padding: "14px 16px",
+              borderRadius: 12,
+              border: "1px solid #f3caca",
+              background: "#fff5f5",
+              color: "#a52323",
+            }}>
+              {error}
+            </p>
+          )}
+          {message && (
+            <p role="status" style={{
+              padding: "14px 16px",
+              borderRadius: 12,
+              border: "1px solid #bfe8d7",
+              background: "#effaf5",
+              color: "#12634b",
+            }}>
+              {message}
+            </p>
+          )}
+
+          <form onSubmit={prepareSpreadsheet} style={{ marginTop: 28, paddingTop: 24, borderTop: "1px solid #e2ebef" }}>
+            <h2 style={{ marginTop: 0, marginBottom: 8, fontSize: 23, fontWeight: 850, color: "#172033" }}>
+              2. Conferir e importar
+            </h2>
+            <p style={{ color: "#64748b", lineHeight: 1.6, marginTop: 0 }}>
+              Confira os dados extraídos do documento e só então confirme a gravação.
+            </p>
+
+            <label htmlFor="document-kind" style={labelStyle}>
+              Destino dos dados
+            </label>
+            <select
+              id="document-kind"
+              value={kind}
+              onChange={(event) => {
+                setKind(event.target.value as ImportKind);
+                setReviewReady(false);
+                setMessage("");
+              }}
+              style={inputStyle}
+            >
+              <option value="divida">Dívidas — importar cobranças pendentes</option>
+              <option value="saldo">Finanças — atualizar saldo de uma conta</option>
+            </select>
+
+            {kind === "saldo" && (
+              <>
+                <label htmlFor="document-wallet" style={labelStyle}>
+                  Conta financeira
+                </label>
+                <select
+                  id="document-wallet"
+                  value={walletId}
+                  onChange={(event) => setWalletId(event.target.value)}
+                  style={inputStyle}
+                  required
+                >
+                  <option value="">Selecione uma conta</option>
+                  {wallets.map((wallet) => (
+                    <option key={wallet.id} value={wallet.id}>
+                      {wallet.name} — saldo atual: {money(Number(wallet.balance))}
+                    </option>
+                  ))}
+                </select>
+                <p style={{ color: "#64748b", fontSize: 13, lineHeight: 1.5 }}>
+                  O saldo confirmado substituirá o saldo atual; ele não será somado.
+                </p>
+              </>
+            )}
+
+            <button
+              type="submit"
+              disabled={saving || loading}
+              style={{
+                width: "100%",
+                marginTop: 18,
+                padding: "15px 18px",
+                border: 0,
+                borderRadius: 14,
+                background: saving || loading
+                  ? "#91aeb4"
+                  : reviewReady
+                    ? "linear-gradient(135deg, #15803d, #0f766e)"
+                    : "linear-gradient(135deg, #087e8b, #075985)",
+                color: "#fff",
+                fontSize: 16,
+                fontWeight: 800,
+                boxShadow: "0 8px 18px rgba(8,126,139,.18)",
+                cursor: saving || loading ? "wait" : "pointer",
+              }}
+            >
+              {saving
+                ? "Preparando..."
+                : reviewReady
+                  ? "✓ Planilha preparada para visualização"
+                  : "Preparar documento para visualização"}
+            </button>
+
+            {reviewReady && (
+              <section
+                aria-label="Planilha de conferência dos dados extraídos"
+                style={{
+                  marginTop: 22,
+                  padding: 18,
+                  borderRadius: 18,
+                  border: "1px solid #bfdbfe",
+                  background: "linear-gradient(135deg, #eff6ff, #f0fdfa)",
+                  boxShadow: "0 8px 24px rgba(30,64,110,.07)",
+                }}
+              >
+                <div style={{
+                  display: "flex",
+                  flexWrap: "wrap",
+                  justifyContent: "space-between",
+                  alignItems: "center",
+                  gap: 10,
+                  marginBottom: 14,
+                }}>
+                  <div>
+                    <h3 style={{ margin: 0, fontSize: 19, color: "#172033" }}>
+                      Planilha de conferência
+                    </h3>
+                    <p style={{ margin: "5px 0 0", color: "#64748b", fontSize: 13 }}>
+                      Confira os dados extraídos. Esta etapa não grava informações no sistema.
+                    </p>
+                  </div>
+                  <span style={{
+                    padding: "6px 10px",
+                    borderRadius: 999,
+                    background: "#dbeafe",
+                    color: "#1d4ed8",
+                    fontWeight: 800,
+                    fontSize: 12,
+                  }}>
+                    {kind === "divida" ? "DÍVIDAS" : "SALDO FINANCEIRO"}
+                  </span>
+                </div>
+
+                {csvRows.length > 1 && (() => {
+                 const normalizeHeader = (value: string) =>
+                   String(value || "").normalize("NFD")
+                     .replace(/[\u0300-\u036f]/g, "")
+                     .toLowerCase().replace(/[_-]+/g, " ").trim();
+
+                 const headers = csvRows[0] || [];
+                 const amountIndex = headers.findIndex((value) =>
+                   /^(valor da divida|valor devido|valor a pagar|valor em aberto|valor da conta|valor original|valor|valor r\$|vl|amount due|debt amount|amount)$/.test(normalizeHeader(value))
+                 );
+                 const statusIndex = headers.findIndex((value) =>
+                   /^(status|situacao|situacao do pagamento|status do pagamento|pago|pagamento|payment status)$/.test(normalizeHeader(value))
+                 );
+
+                 const parseCellAmount = (value: string) => {
+                   const raw = String(value ?? "").trim();
+                   if (!raw || !/\d/.test(raw)) return 0;
+                   const parsed = parseAmount(raw);
+                   return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+                 };
+
+                 const totals = csvRows.slice(1).reduce(
+                   (acc, row) => {
+                     const value = parseCellAmount(row[amountIndex] || "");
+                     const status = normalizeHeader(statusIndex >= 0 ? row[statusIndex] || "" : "");
+                     if (/^(pago|paga|quitado|quitada|sim|yes|paid)$/.test(status)) {
+                       acc.paid += value;
+                     } else {
+                       acc.pending += value;
+                     }
+                     return acc;
+                   },
+                   { paid: 0, pending: 0 },
+                 );
+
+                 const cards = amountIndex < 0 ? [] : [
+                   { label: "Total pago", value: totals.paid, bg: "#dcfce7", fg: "#166534" },
+                   { label: "Total pendente", value: totals.pending, bg: "#ffedd5", fg: "#9a3412" },
+                   { label: "Total considerado", value: totals.paid + totals.pending, bg: "#dbeafe", fg: "#1d4ed8" },
+                 ];
+
+                 return (
+                   <section style={{ marginBottom: 18 }}>
+                     <h4 style={{ margin: "0 0 6px", color: "#0f172a", fontSize: 17 }}>
+                       Resumo financeiro da planilha
+                     </h4>
+                     <p style={{ margin: "0 0 12px", color: "#64748b", fontSize: 12 }}>
+                       O cálculo utiliza apenas uma coluna reconhecida como valor da dívida. Saldo, total geral e valor pago não são somados como colunas adicionais.
+                     </p>
+                     {amountIndex < 0 ? (
+                       <p style={{ padding: 12, borderRadius: 10, background: "#fef3c7", color: "#92400e" }}>
+                         Não foi identificada uma coluna segura de valor da dívida. Confira os cabeçalhos antes de salvar.
+                       </p>
+                     ) : (
+                       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(170px, 1fr))", gap: 10 }}>
+                         {cards.map((card) => (
+                           <div key={card.label} style={{ padding: 14, borderRadius: 13, background: card.bg, color: card.fg }}>
+                             <div style={{ fontSize: 12, fontWeight: 800 }}>{card.label}</div>
+                             <div style={{ fontSize: 20, fontWeight: 900, marginTop: 7 }}>{money(card.value)}</div>
+                           </div>
+                         ))}
+                       </div>
+                     )}
+                     {statusIndex < 0 && (
+                       <p style={{ margin: "8px 0 0", color: "#64748b", fontSize: 12 }}>
+                         A planilha não possui coluna de pagamento reconhecida; os valores estão classificados como pendentes para esta prévia.
+                       </p>
+                     )}
+                   </section>
+                 );
+               })()}
+
+                {kind === "divida" && csvRows.length > 1 && (
+                 <section style={{ marginBottom: 14, padding: 14, border: "1px solid #cbd5e1", borderRadius: 12, background: "#fff" }}>
+                   <h4 style={{ margin: "0 0 10px", color: "#0f172a" }}>Personalizar colunas visíveis</h4>
+                   <div style={{ display: "flex", flexWrap: "wrap", gap: 10 }}>
+                     {csvRows[0].map((heading, index) => (
+                       <label key={index} style={{ display: "flex", alignItems: "center", gap: 6, padding: "7px 10px", borderRadius: 8, background: "#f1f5f9", color: "#334155", fontSize: 13 }}>
+                         <input
+                           type="checkbox"
+                           checked={visibleColumns.includes(index)}
+                           onChange={(event) => setVisibleColumns((current) =>
+                             event.target.checked
+                               ? [...current, index].sort((a, b) => a - b)
+                               : current.filter((column) => column !== index)
+                           )}
+                         />
+                         {heading || `Coluna ${index + 1}`}
+                       </label>
+                     ))}
+                   </div>
+                   <p style={{ margin: "9px 0 0", fontSize: 12, color: "#64748b" }}>
+                     Ocultar uma coluna não apaga os dados originais da prévia.
+                   </p>
+                 </section>
+               )}
+
+               <div style={{ overflowX: "auto", borderRadius: 12, background: "#fff" }}>
+                  <table style={{
+                    width: "100%",
+                    borderCollapse: "collapse",
+                    minWidth: 600,
+                    fontSize: 13,
+                  }}>
+                    <thead>
+                      <tr style={{ background: "#e0f2fe", color: "#164e63" }}>
+                        {(kind === "saldo"
+                          ? ["Conta", "Saldo extraído", "Arquivo"]
+                          : csvRows.length > 1
+                            ? visibleColumns.map((column) => csvRows[0][column])
+                            : ["Descrição", "Credor", "Vencimento", "Valor (R$)"]
+                        ).map((heading, index) => (
+                          <th key={index} style={{
+                            padding: "12px 14px",
+                            borderBottom: "1px solid #cbd5e1",
+                            textAlign: "left",
+                            whiteSpace: "nowrap",
+                          }}>
+                            {heading || `Coluna ${index + 1}`}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {kind === "saldo" ? (
+                        <tr>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0" }}>
+                            {wallets.find((wallet) => wallet.id === walletId)?.name || "Conta não selecionada"}
+                          </td>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0", fontWeight: 800, color: "#0f766e" }}>
+                            {money(parseAmount(amount))}
+                          </td>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0", overflowWrap: "anywhere" }}>
+                            {fileName || "—"}
+                          </td>
+                        </tr>
+                      ) : csvRows.length > 1 ? (
+                        csvRows.slice(1, 101).map((row, rowIndex) => (
+                          <tr key={rowIndex} style={{ background: rowIndex % 2 ? "#f8fafc" : "#fff" }}>
+                            {visibleColumns.map((columnIndex) => (
+                              <td key={columnIndex} style={{
+                                padding: "6px 8px",
+                                borderBottom: "1px solid #e2e8f0",
+                                minWidth: 130,
+                              }}>
+                                <input
+                                  aria-label={`Editar linha ${rowIndex + 2}, coluna ${csvRows[0][columnIndex] || columnIndex + 1}`}
+                                  value={row[columnIndex] || ""}
+                                  onChange={(event) => {
+                                    const value = event.target.value;
+                                    setCsvRows((current) => current.map((currentRow, currentIndex) =>
+                                      currentIndex === rowIndex + 1
+                                        ? currentRow.map((cell, cellIndex) => cellIndex === columnIndex ? value : cell)
+                                        : currentRow
+                                    ));
+                                  }}
+                                  style={{
+                                    width: "100%",
+                                    minWidth: 110,
+                                    padding: "8px",
+                                    border: "1px solid #cbd5e1",
+                                    borderRadius: 7,
+                                    background: "#fff",
+                                    color: "#0f172a",
+                                    fontSize: 13,
+                                  }}
+                                />
+                              </td>
+                            ))}
+                          </tr>
+                        ))
+                      ) : (
+                        <tr>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0" }}>
+                            {name.trim() || "Dívida importada"}
+                          </td>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0" }}>
+                            {creditor.trim() || "Não identificado"}
+                          </td>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0" }}>
+                            {date || "Data não identificada"}
+                          </td>
+                          <td style={{ padding: 12, borderBottom: "1px solid #e2e8f0", fontWeight: 800, color: "#b45309" }}>
+                            {money(parseAmount(amount))}
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+
+                <p style={{ margin: "12px 0 0", color: "#475569", fontSize: 13, lineHeight: 1.6 }}>
+                  {kind === "divida" && csvRows.length > 1
+                    ? `Prévia de até 100 linhas para conferência visual. Nenhum dado é importado.`
+                    : "Esta é a prévia dos dados extraídos. Os dados não são salvos nesta etapa."}
+                </p>
+
+                {kind === "divida" && (
+                  <div style={{
+                    display: "flex",
+                    flexWrap: "wrap",
+                    gap: 12,
+                    marginTop: 18,
+                    alignItems: "center",
+                  }}>
+                    <button
+                      type="button"
+                      onClick={() => void saveReviewedData()}
+                      disabled={saving || loading || !reviewReady}
+                      style={{
+                        flex: "1 1 240px",
+                        minHeight: 50,
+                        padding: "14px 18px",
+                        border: 0,
+                        borderRadius: 12,
+                        background: saving || loading
+                          ? "#94a3b8"
+                          : "linear-gradient(135deg, #15803d, #0f766e)",
+                        color: "#fff",
+                        fontSize: 15,
+                        fontWeight: 800,
+                        cursor: saving || loading ? "wait" : "pointer",
+                      }}
+                    >
+                      {saving ? "Salvando..." : "✓ Confirmar e salvar dívidas"}
+                    </button>
+                    <span style={{
+                      flex: "1 1 220px",
+                      color: "#475569",
+                      fontSize: 12,
+                      lineHeight: 1.5,
+                    }}>
+                      Só serão salvas após sua confirmação. Confira os dados
+                      e as datas antes de continuar.
+                    </span>
+                  </div>
+                )}
+              </section>
+            )}
+          </form>
+
+        </section>
+
+        <p style={{
+          color: "#64748b",
+          fontSize: 13,
+          lineHeight: 1.7,
+          marginTop: 18,
+        }}>
+          Privacidade: esta página processa os arquivos temporariamente no navegador.
+          Nesta etapa, os dados são apenas coletados e exibidos para conferência;
+          nenhuma dívida ou saldo é gravado no banco de dados.
+        </p>
+      </div>
+    </main>
+  );
+}
+
+const labelStyle: React.CSSProperties = {
+  display: "block",
+  marginTop: 18,
+  marginBottom: 7,
+  fontWeight: 700,
+  fontSize: 14,
+};
+
+const inputStyle: React.CSSProperties = {
+  display: "block",
+  width: "100%",
+  boxSizing: "border-box",
+  minHeight: 48,
+  padding: "12px 14px",
+  border: "1px solid #cbd5e1",
+  borderRadius: 12,
+  background: "#fff",
+  color: "#172033",
+  fontSize: 15,
+  outlineColor: "#087e8b",
+};

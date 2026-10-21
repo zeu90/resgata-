@@ -1,0 +1,152 @@
+import Link from "next/link";
+
+const features = [
+  {
+    icon: "📊",
+    title: "Veja sua situação com clareza",
+    text: "Organize valores, vencimentos e prioridades em um único painel."
+  },
+  {
+    icon: "🗓️",
+    title: "Acompanhe cada dívida",
+    text: "Registre credores, datas, pagamentos e o que ainda está pendente."
+  },
+  {
+    icon: "🌱",
+    title: "Valorize cada escolha",
+    text: "Registre o dinheiro que você decidiu economizar ao evitar apostas."
+  }
+];
+
+export default function HomePage() {
+  return (
+    <>
+      <header className="container nav">
+        <Link href="/" className="brand">
+          <span className="brand-mark">R</span>
+          <span>Resgata Dívidas</span>
+        </Link>
+        <nav className="navlinks" aria-label="Navegação principal">
+          <a href="#como-funciona">Como funciona</a>
+          <a href="#recursos">Recursos</a>
+          <a href="#planos">Planos</a>
+          <Link href="/login">Entrar</Link>
+          <Link className="btn" href="/register">Começar agora</Link>
+        </nav>
+      </header>
+
+      <main>
+        <section className="hero">
+          <div className="container hero-grid">
+            <div>
+              <span className="eyebrow">Organização financeira, um passo de cada vez</span>
+              <h1>Recupere o controle. <span>Recomece com clareza.</span></h1>
+              <p>
+                Organize suas dívidas, acompanhe seus pagamentos e registre
+                cada valor que você consegue guardar. Seu progresso começa
+                com pequenas decisões.
+              </p>
+              <div className="actions">
+                <Link className="btn" href="/register">Criar minha conta grátis</Link>
+                <a className="btn btn-secondary" href="#como-funciona">Conhecer a plataforma</a>
+              </div>
+              <p><small>Seus registros financeiros são privados e vinculados à sua conta.</small></p>
+            </div>
+
+            <div className="hero-card" aria-label="Exemplo ilustrativo do painel">
+              <span className="eyebrow">Seu progresso em um só lugar</span>
+              <h2>Organização que traz tranquilidade</h2>
+              <div className="preview-balance">
+                <small>Exemplo ilustrativo · Total de dívidas pendentes</small>
+                <strong>R$ 2.450,00</strong>
+              </div>
+              <div className="preview-line"><span>Contas organizadas</span><strong>Por vencimento</strong></div>
+              <div className="preview-line"><span>Pagamentos</span><strong>Acompanhados</strong></div>
+              <div className="preview-line"><span>Dinheiro economizado</span><strong>Registrado por você</strong></div>
+              <p className="muted"><small>Os valores acima são apenas exemplos, não dados de uma conta real.</small></p>
+            </div>
+          </div>
+        </section>
+
+        <section className="section" id="como-funciona">
+          <div className="container">
+            <div className="section-heading">
+              <h2>Um caminho mais organizado para suas finanças</h2>
+              <p>Sem promessas milagrosas. Apenas ferramentas para você acompanhar sua situação e tomar decisões com mais informação.</p>
+            </div>
+            <div className="grid">
+              {features.map((feature) => (
+                <article className="feature" key={feature.title}>
+                  <div className="feature-icon" aria-hidden="true">{feature.icon}</div>
+                  <h3>{feature.title}</h3>
+                  <p>{feature.text}</p>
+                </article>
+              ))}
+            </div>
+          </div>
+        </section>
+
+        <section className="section section-white" id="recursos">
+          <div className="container">
+            <div className="section-heading">
+              <h2>Feito para acompanhar sua evolução</h2>
+              <p>Uma visão prática para sair da confusão e construir hábitos financeiros mais conscientes.</p>
+            </div>
+            <div className="grid">
+              <article className="feature"><h3>Lista de dívidas</h3><p>Cadastre credor, valor, vencimento e prioridade. Atualize o status conforme realizar pagamentos.</p></article>
+              <article className="feature"><h3>Painel de acompanhamento</h3><p>Consulte os totais registrados e veja o que precisa de atenção primeiro.</p></article>
+              <article className="feature"><h3>Registro de economia</h3><p>Anote valores que decidiu guardar ao evitar apostas e acompanhe o total acumulado.</p></article>
+            </div>
+          </div>
+        </section>
+
+        <section className="section" id="planos">
+          <div className="container">
+            <div className="section-heading">
+              <h2>Comece no seu ritmo</h2>
+              <p>As condições comerciais precisam estar configuradas e testadas antes de qualquer cobrança.</p>
+            </div>
+            <div className="grid">
+              <article className="feature">
+                <span className="eyebrow">Para começar</span>
+                <h3>Acesso inicial</h3>
+                <p>Conheça as ferramentas de organização e registre sua situação financeira.</p>
+                <Link className="btn btn-secondary btn-block" href="/register">Criar conta</Link>
+              </article>
+              <article className="feature">
+                <span className="eyebrow">Plano planejado</span>
+                <h3>Mensal</h3>
+                <p>Preço previsto: R$ 9,90/mês, sujeito à configuração e ativação do sistema de pagamentos.</p>
+                <Link className="btn btn-block" href="/register">Começar</Link>
+              </article>
+              <article className="feature">
+                <span className="eyebrow">Transparência</span>
+                <h3>Teste de 7 dias</h3>
+                <p>O período de teste só será considerado ativo quando as regras forem implementadas e verificadas.</p>
+                <Link className="btn btn-secondary btn-block" href="/login">Já tenho conta</Link>
+              </article>
+            </div>
+          </div>
+        </section>
+
+        <section className="section section-white">
+          <div className="container section-heading">
+            <h2>Seu próximo passo pode começar hoje</h2>
+            <p>Crie sua conta e comece a organizar seus registros.</p>
+            <div className="actions" style={{ justifyContent: "center" }}>
+              <Link className="btn" href="/register">Criar minha conta</Link>
+              <Link className="btn btn-secondary" href="/login">Entrar na plataforma</Link>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer className="footer">
+        <div className="container footer-inner">
+          <span>© {new Date().getFullYear()} Resgata Dívidas</span>
+          <span>Organização financeira com clareza e responsabilidade.</span>
+        </div>
+      </footer>
+    </>
+  );
+}
